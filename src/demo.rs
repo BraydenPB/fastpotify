@@ -1,0 +1,634 @@
+//! Sample data for screenshots and headless rendering tests.
+//!
+//! Nothing here talks to Spotify: the backend is switched offline, the
+//! session is marked connected, and every page is filled with plausible
+//! content. Cover art comes from a public placeholder service so the artwork
+//! pipeline (download, disk cache, accent colour) is exercised too.
+
+use std::time::Instant;
+
+use crate::api::models::{
+    Album, Artist, ArtistRef, Context, Copyright, Device, Episode, Followers, Image, Owner,
+    Page as ApiPage, PlayHistory, PlayableItem, PlaybackState, Playlist, PlaylistItem, Queue,
+    ResumePoint, SavedAlbum, SavedEpisode, SavedShow, SavedTrack, SearchResults, Show, Track,
+    TrackCount, User,
+};
+use crate::app::{App, RemoteSnapshot};
+use crate::backend::AuthStatus;
+use crate::model::*;
+
+fn image(seed: u32) -> Vec<Image> {
+    vec![
+        Image {
+            url: format!("https://picsum.photos/seed/fastpotify{seed}/640/640"),
+            width: Some(640),
+            height: Some(640),
+        },
+        Image {
+            url: format!("https://picsum.photos/seed/fastpotify{seed}/300/300"),
+            width: Some(300),
+            height: Some(300),
+        },
+        Image {
+            url: format!("https://picsum.photos/seed/fastpotify{seed}/64/64"),
+            width: Some(64),
+            height: Some(64),
+        },
+    ]
+}
+
+const ARTISTS: &[&str] = &[
+    "Bonobo",
+    "Khruangbin",
+    "Nils Frahm",
+    "Little Simz",
+    "Floating Points",
+    "Jon Hopkins",
+    "Sault",
+    "Four Tet",
+];
+
+const ALBUMS: &[(&str, usize, &str)] = &[
+    ("Fragments", 0, "2022"),
+    ("Mordechai", 1, "2020"),
+    ("All Melody", 2, "2018"),
+    ("Sometimes I Might Be Introvert", 3, "2021"),
+    ("Promises", 4, "2021"),
+    ("Immunity", 5, "2013"),
+    ("Untitled (Black Is)", 6, "2020"),
+    ("There Is Love in You", 7, "2010"),
+];
+
+const TRACKS: &[&str] = &[
+    "Rosewood",
+    "Otomo",
+    "Shadows",
+    "Tides",
+    "Elysian",
+    "Closer",
+    "Counterpart",
+    "Sapien",
+    "From You",
+    "Day by Day",
+    "Age of Phase",
+    "Polyghost",
+    "Time Moves Slow",
+    "August 10",
+    "So Rare",
+    "Fugue",
+    "Encores",
+    "Sunlight",
+    "My Friend the Forest",
+    "Kaleidoscope",
+];
+
+const PLAYLISTS: &[&str] = &[
+    "Discover Weekly",
+    "Late night focus",
+    "Sunday morning",
+    "Running 2026",
+    "Release Radar",
+    "Berlin nights",
+    "Dinner party",
+    "Deep work",
+    "Road trip",
+    "Kitchen jams",
+];
+
+fn artist_ref(index: usize) -> ArtistRef {
+    ArtistRef {
+        id: Some(format!("art{index}")),
+        name: ARTISTS[index % ARTISTS.len()].to_string(),
+        uri: Some(format!("spotify:artist:art{index}")),
+    }
+}
+
+fn artist(index: usize) -> Artist {
+    Artist {
+        id: format!("art{index}"),
+        name: ARTISTS[index % ARTISTS.len()].to_string(),
+        uri: format!("spotify:artist:art{index}"),
+        images: image(100 + index as u32),
+        genres: vec!["electronic".into(), "downtempo".into(), "ambient".into()],
+        followers: Some(Followers {
+            total: 1_284_930 + index as u64 * 10_431,
+        }),
+        popularity: Some(70),
+        ..Artist::default()
+    }
+}
+
+fn album(index: usize) -> Album {
+    let (name, artist_index, year) = ALBUMS[index % ALBUMS.len()];
+    Album {
+        id: format!("alb{index}"),
+        name: name.to_string(),
+        uri: format!("spotify:album:alb{index}"),
+        album_type: Some(if index % 4 == 3 {
+            "single".into()
+        } else {
+            "album".into()
+        }),
+        total_tracks: Some(12),
+        images: image(200 + index as u32),
+        artists: vec![artist_ref(artist_index)],
+        release_date: Some(format!("{year}-03-1{}", index % 9)),
+        label: Some("Ninja Tune".into()),
+        copyrights: vec![Copyright {
+            text: format!("{year} Ninja Tune"),
+            kind: "C".into(),
+        }],
+        ..Album::default()
+    }
+}
+
+fn track(index: usize) -> Track {
+    let album_index = index % ALBUMS.len();
+    let mut album = album(album_index);
+    album.tracks = None;
+    Track {
+        id: Some(format!("trk{index}")),
+        name: TRACKS[index % TRACKS.len()].to_string(),
+        uri: format!("spotify:track:trk{index}"),
+        duration_ms: 180_000 + (index as u32 * 37_000) % 240_000,
+        explicit: index % 7 == 3,
+        artists: vec![artist_ref(album_index)],
+        album: Some(album),
+        track_number: Some((index % 12) as u32 + 1),
+        disc_number: Some(1),
+        popularity: Some(60 + (index % 40) as u8),
+        ..Track::default()
+    }
+}
+
+fn playlist(index: usize) -> Playlist {
+    let name = PLAYLISTS[index % PLAYLISTS.len()];
+    let spotify_owned = matches!(name, "Discover Weekly" | "Release Radar");
+    Playlist {
+        id: format!("pl{index}"),
+        name: name.to_string(),
+        uri: format!("spotify:playlist:pl{index}"),
+        description: Some(if spotify_owned {
+            "Your weekly mixtape of fresh music. Enjoy new music and deep cuts picked for you. Updates every Monday.".into()
+        } else {
+            String::new()
+        }),
+        images: image(300 + index as u32),
+        owner: Owner {
+            id: Some(if spotify_owned {
+                "spotify".into()
+            } else {
+                "demo".into()
+            }),
+            display_name: Some(if spotify_owned {
+                "Spotify".into()
+            } else {
+                "Carmine".into()
+            }),
+            uri: None,
+        },
+        public: Some(index.is_multiple_of(2)),
+        collaborative: false,
+        snapshot_id: Some("snap".into()),
+        tracks: Some(TrackCount {
+            total: 30 + index as u32 * 7,
+        }),
+        ..Playlist::default()
+    }
+}
+
+fn episode(index: usize, show_index: usize) -> Episode {
+    Episode {
+        id: format!("ep{show_index}_{index}"),
+        name: format!("Episode {}: {}", 120 - index, TRACKS[(index * 3) % TRACKS.len()]),
+        uri: format!("spotify:episode:ep{show_index}_{index}"),
+        duration_ms: 2_400_000 + (index as u32 * 311_000) % 2_000_000,
+        description: "A conversation about how software gets made, why some tools feel fast, and what we can learn from the people who build them. Recorded live.".into(),
+        images: image(400 + index as u32),
+        release_date: Some(format!("2026-0{}-{:02}", 1 + index % 8, 1 + index % 27)),
+        resume_point: Some(ResumePoint {
+            fully_played: index.is_multiple_of(5),
+            resume_position_ms: if index % 3 == 1 { 600_000 } else { 0 },
+        }),
+        show: Some(show(show_index)),
+        ..Episode::default()
+    }
+}
+
+fn show(index: usize) -> Show {
+    Show {
+        id: format!("sh{index}"),
+        name: ["Rework", "Song Exploder", "The Rest Is History", "Darknet Diaries"][index % 4].into(),
+        uri: format!("spotify:show:sh{index}"),
+        publisher: ["37signals", "Hrishikesh Hirway", "Goalhanger", "Jack Rhysider"][index % 4].into(),
+        description: "A podcast about a better way to work and run your business. Hosted by the founders of 37signals.".into(),
+        images: image(500 + index as u32),
+        total_episodes: Some(84),
+        ..Show::default()
+    }
+}
+
+fn page<T>(items: Vec<T>) -> ApiPage<T> {
+    let total = items.len() as u32;
+    ApiPage {
+        items,
+        total,
+        limit: total,
+        offset: 0,
+        next: None,
+    }
+}
+
+pub fn populate(app: &mut App) {
+    app.backend.set_offline(true);
+    app.offline = true;
+    app.auth = AuthStatus::Connected {
+        username: "demo".into(),
+    };
+    app.local_device_id = Some("local-demo".into());
+    app.local_ready = true;
+    app.local_playback = crate::backend::LocalPlayback::Ready {
+        device_id: "local-demo".into(),
+    };
+    app.user = Some(User {
+        id: "demo".into(),
+        display_name: Some("Carmine".into()),
+        images: image(1),
+        product: Some("premium".into()),
+        country: Some("DE".into()),
+        uri: Some("spotify:user:demo".into()),
+    });
+
+    let playlists: Vec<Playlist> = (0..PLAYLISTS.len()).map(playlist).collect();
+    for playlist in &playlists {
+        app.saved.insert(playlist.uri.clone(), true);
+    }
+    app.library.playlists = Loadable::Loaded(playlists.clone());
+
+    let tracks: Vec<Track> = (0..40).map(track).collect();
+    for (index, track) in tracks.iter().enumerate() {
+        app.saved.insert(track.uri.clone(), index % 3 == 0);
+    }
+
+    // Playlist page.
+    let mut playlist_page = PlaylistPage {
+        playlist: Loadable::Loaded(playlists[1].clone()),
+        ..PlaylistPage::default()
+    };
+    playlist_page.items.absorb(
+        0,
+        page(
+            tracks
+                .iter()
+                .enumerate()
+                .map(|(index, track)| PlaylistItem {
+                    added_at: Some(format!(
+                        "2026-0{}-{:02}T10:00:00Z",
+                        1 + index % 8,
+                        1 + index % 27
+                    )),
+                    is_local: false,
+                    item: Some(PlayableItem::Track(track.clone())),
+                    track: None,
+                })
+                .collect(),
+        ),
+    );
+    app.playlist_pages.insert("pl1".into(), playlist_page);
+    let mut discover_page = PlaylistPage {
+        playlist: Loadable::Loaded(playlists[0].clone()),
+        ..PlaylistPage::default()
+    };
+    discover_page.items.absorb(
+        0,
+        page(
+            tracks
+                .iter()
+                .rev()
+                .take(30)
+                .map(|track| PlaylistItem {
+                    added_at: Some("2026-08-24T05:00:00Z".into()),
+                    is_local: false,
+                    item: Some(PlayableItem::Track(track.clone())),
+                    track: None,
+                })
+                .collect(),
+        ),
+    );
+    app.playlist_pages.insert("pl0".into(), discover_page);
+
+    // Album page.
+    let mut album_page = AlbumPage {
+        album: Loadable::Loaded(album(0)),
+        ..AlbumPage::default()
+    };
+    album_page
+        .tracks
+        .absorb(0, page(tracks.iter().take(12).cloned().collect()));
+    app.album_pages.insert("alb0".into(), album_page);
+    app.saved.insert("spotify:album:alb0".into(), true);
+
+    // Artist page.
+    let mut artist_page = ArtistPage {
+        artist: Loadable::Loaded(artist(0)),
+        top_tracks: Loadable::Loaded(tracks.iter().take(10).cloned().collect()),
+        related: Loadable::Loaded((1..8).map(artist).collect()),
+        ..ArtistPage::default()
+    };
+    let mut albums = PagedList::default();
+    albums.absorb(0, page((0..8).map(album).collect()));
+    artist_page
+        .albums
+        .insert(DiscographyFilter::All.groups().to_string(), albums);
+    app.artist_pages.insert("art0".into(), artist_page);
+    app.saved.insert("spotify:artist:art0".into(), true);
+
+    // Show page.
+    let mut show_page = ShowPage {
+        show: Loadable::Loaded(show(0)),
+        ..ShowPage::default()
+    };
+    show_page
+        .episodes
+        .absorb(0, page((0..15).map(|index| episode(index, 0)).collect()));
+    app.show_pages.insert("sh0".into(), show_page);
+
+    // Library.
+    app.library.liked.absorb(
+        0,
+        page(
+            tracks
+                .iter()
+                .filter(|track| app.saved.get(&track.uri) == Some(&true))
+                .map(|track| SavedTrack {
+                    added_at: Some("2026-06-12T08:30:00Z".into()),
+                    track: track.clone(),
+                })
+                .collect(),
+        ),
+    );
+    app.library.albums.absorb(
+        0,
+        page(
+            (0..8)
+                .map(|index| SavedAlbum {
+                    added_at: None,
+                    album: album(index),
+                })
+                .collect(),
+        ),
+    );
+    app.library.artists.items = (0..8).map(artist).collect();
+    app.library.artists.loaded_once = true;
+    app.library.artists.complete = true;
+    app.library.shows.absorb(
+        0,
+        page(
+            (0..4)
+                .map(|index| SavedShow {
+                    added_at: None,
+                    show: show(index),
+                })
+                .collect(),
+        ),
+    );
+    app.library.episodes.absorb(
+        0,
+        page(
+            (0..6)
+                .map(|index| SavedEpisode {
+                    added_at: None,
+                    episode: episode(index, index % 4),
+                })
+                .collect(),
+        ),
+    );
+
+    // Home.
+    app.home.requested = true;
+    app.home.loaded_at = Some(Instant::now());
+    app.home.recently_played = Loadable::Loaded(
+        tracks
+            .iter()
+            .skip(5)
+            .take(12)
+            .map(|track| PlayHistory {
+                track: track.clone(),
+                played_at: Some("2026-08-26T21:12:00Z".into()),
+                context: None,
+            })
+            .collect(),
+    );
+    app.home.top_artists = Loadable::Loaded((0..8).map(artist).collect());
+    app.home.top_tracks = Loadable::Loaded(tracks.iter().skip(10).take(10).cloned().collect());
+    app.home.recommendations = Loadable::Loaded(tracks.iter().skip(20).take(10).cloned().collect());
+    for term in DISCOVER_TERMS {
+        let matching: Vec<Playlist> = playlists
+            .iter()
+            .filter(|playlist| playlist.name.to_lowercase().contains(&term.to_lowercase()))
+            .cloned()
+            .collect();
+        app.home
+            .discover
+            .insert((*term).to_string(), Loadable::Loaded(matching));
+    }
+
+    // Search.
+    app.search.query = "Bonobo".into();
+    app.search.committed = "Bonobo".into();
+    app.search.results = Loadable::Loaded(SearchResults {
+        tracks: Some(page(tracks.iter().take(10).cloned().collect())),
+        artists: Some(page((0..6).map(artist).collect())),
+        albums: Some(page((0..6).map(album).collect())),
+        playlists: Some(page(playlists.iter().take(6).cloned().collect())),
+        shows: Some(page((0..4).map(show).collect())),
+        episodes: Some(page((0..4).map(|index| episode(index, 1)).collect())),
+    });
+    app.settings.search_history = vec!["Khruangbin".into(), "ambient".into(), "Rework".into()];
+
+    // Playback: a remote speaker is playing the second playlist.
+    app.queue = Loadable::Loaded(Queue {
+        currently_playing: Some(PlayableItem::Track(tracks[0].clone())),
+        queue: tracks
+            .iter()
+            .skip(1)
+            .take(12)
+            .cloned()
+            .map(PlayableItem::Track)
+            .collect(),
+    });
+    app.devices = vec![
+        Device {
+            id: Some("local-demo".into()),
+            name: "Fastpotify".into(),
+            is_active: false,
+            is_restricted: false,
+            volume_percent: Some(70),
+            supports_volume: Some(true),
+            kind: "computer".into(),
+        },
+        Device {
+            id: Some("remote1".into()),
+            name: "Kitchen speaker".into(),
+            is_active: true,
+            is_restricted: false,
+            volume_percent: Some(62),
+            supports_volume: Some(true),
+            kind: "speaker".into(),
+        },
+        Device {
+            id: Some("remote2".into()),
+            name: "Pixel 9".into(),
+            is_active: false,
+            is_restricted: false,
+            volume_percent: Some(40),
+            supports_volume: Some(true),
+            kind: "smartphone".into(),
+        },
+    ];
+    app.remote = Some(RemoteSnapshot {
+        state: PlaybackState {
+            device: Some(app.devices[1].clone()),
+            repeat_state: "off".into(),
+            shuffle_state: true,
+            context: Some(Context {
+                uri: playlists[1].uri.clone(),
+                kind: "playlist".into(),
+            }),
+            timestamp: 0,
+            progress_ms: Some(83_000),
+            is_playing: true,
+            item: Some(PlayableItem::Track(tracks[0].clone())),
+            currently_playing_type: Some("track".into()),
+        },
+        received_at: Instant::now(),
+    });
+    for track in &tracks {
+        if let Some(id) = &track.id {
+            app.track_cache.insert(id.clone(), track.clone());
+        }
+    }
+}
+
+/// Applies `--demo-page` and `--demo-show`.
+#[cfg(feature = "demo")]
+pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
+    if let Some(page) = page.and_then(Page::decode) {
+        app.open(page);
+    }
+    for surface in show.unwrap_or("").split(',').map(str::trim) {
+        match surface {
+            "queue" => app.show_queue_panel = true,
+            "devices" => app.show_devices = true,
+            "shortcuts" => app.dialog = Some(Dialog::Shortcuts),
+            "create" => {
+                app.dialog = Some(Dialog::CreatePlaylist {
+                    name: "Autumn drives".into(),
+                    public: false,
+                    add_uris: vec!["spotify:track:trk1".into()],
+                })
+            }
+            "light" => {
+                app.settings.theme = crate::settings::ThemeChoice::Light;
+                app.actions.push(Action::SettingsChanged);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::AppOptions;
+    use crate::paths::AppDirs;
+    use crate::settings::Settings;
+
+    fn frame(ctx: &egui::Context, app: &mut App) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut eframe_frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(input, |ui| {
+            eframe::App::ui(app, ui, &mut eframe_frame);
+        });
+        output.textures_delta.clear();
+    }
+
+    /// Every page, panel, and dialog lays out without panicking.
+    #[test]
+    fn every_surface_renders_headless() {
+        let root =
+            std::env::temp_dir().join(format!("fastpotify-render-test-{}", std::process::id()));
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, dirs, Settings::default(), AppOptions { mpris: false });
+        populate(&mut app);
+
+        let pages = [
+            Page::Home,
+            Page::Search,
+            Page::LikedSongs,
+            Page::Albums,
+            Page::Artists,
+            Page::Podcasts,
+            Page::Episodes,
+            Page::Playlist("pl1".into()),
+            Page::Playlist("missing".into()),
+            Page::Album("alb0".into()),
+            Page::Artist("art0".into()),
+            Page::Show("sh0".into()),
+            Page::Queue,
+            Page::Settings,
+        ];
+        for page in pages {
+            app.open(page.clone());
+            for _ in 0..3 {
+                frame(&ctx, &mut app);
+            }
+            assert_eq!(app.page(), &page);
+        }
+        app.show_queue_panel = true;
+        app.show_devices = true;
+        frame(&ctx, &mut app);
+        for dialog in [
+            Dialog::Shortcuts,
+            Dialog::CreatePlaylist {
+                name: "x".into(),
+                public: true,
+                add_uris: vec![],
+            },
+            Dialog::EditPlaylist {
+                id: "pl1".into(),
+                name: "x".into(),
+                description: String::new(),
+                public: false,
+            },
+            Dialog::ConfirmDeletePlaylist {
+                id: "pl1".into(),
+                name: "x".into(),
+                owned: true,
+            },
+        ] {
+            app.dialog = Some(dialog);
+            frame(&ctx, &mut app);
+        }
+        app.settings.theme = crate::settings::ThemeChoice::Light;
+        app.actions.push(Action::SettingsChanged);
+        app.open(Page::Home);
+        for _ in 0..3 {
+            frame(&ctx, &mut app);
+        }
+        assert!(!app.palette.dark);
+        app.backend.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

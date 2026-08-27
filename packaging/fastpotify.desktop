@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Fastpotify
+GenericName=Music Player
+Comment=A fast, native Spotify client
+Exec=fastpotify
+Icon=fastpotify
+Terminal=false
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=spotify;music;player;
+MimeType=x-scheme-handler/spotify;
+StartupWMClass=fastpotify

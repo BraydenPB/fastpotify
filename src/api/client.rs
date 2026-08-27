@@ -1,0 +1,1096 @@
+//! An authenticated, rate-limited transport for the Spotify Web API.
+//!
+//! The client is deliberately small: a handful of typed calls over one
+//! `request` helper that injects the bearer token, bounds concurrency,
+//! honours `Retry-After`, and maps error bodies to messages a person can
+//! read. Spotify reshaped several endpoints in 2026 (`/me/library`,
+//! `/playlists/{id}/items`, search limits); the client tries the current
+//! shape first and falls back to the classic one when Spotify answers that
+//! an endpoint is gone, remembering the answer for the rest of the session.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::time::Duration;
+
+use reqwest::{Method, StatusCode};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+use thiserror::Error;
+use tokio::sync::Semaphore;
+
+use super::models::*;
+
+const BASE_URL: &str = "https://api.spotify.com/v1";
+const MAX_IN_FLIGHT: usize = 6;
+const RATE_LIMIT_RETRIES: u32 = 3;
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("not signed in")]
+    NotSignedIn,
+    #[error("{message}")]
+    Status { status: u16, message: String },
+    #[error("Spotify is busy right now, try again in a moment")]
+    RateLimited,
+    #[error("your Spotify sign-in expired; please sign in again")]
+    SignInExpired(String),
+    #[error("network error: {0}")]
+    Network(String),
+    #[error("unexpected response from Spotify: {0}")]
+    Decode(String),
+}
+
+impl ApiError {
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Status { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    fn is_gone(&self) -> bool {
+        matches!(self.status(), Some(404) | Some(410) | Some(405) | Some(400))
+    }
+}
+
+impl From<reqwest::Error> for ApiError {
+    fn from(error: reqwest::Error) -> Self {
+        if error.is_decode() {
+            Self::Decode(error.to_string())
+        } else {
+            Self::Network(error.to_string())
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, ApiError>;
+
+/// Where bearer tokens come from.
+///
+/// The Web API is driven by a registered application's PKCE grant, refreshed
+/// on demand and persisted so the browser is needed once per machine. Tokens
+/// minted for Spotify's own desktop client are throttled on the Web API, so
+/// they are never used here. `Fixed` exists only for tests.
+#[derive(Clone)]
+pub enum TokenProvider {
+    Web(std::sync::Arc<WebTokens>),
+}
+
+impl TokenProvider {
+    async fn access_token(&self) -> Result<String> {
+        match self {
+            Self::Web(tokens) => tokens.access_token(false).await,
+        }
+    }
+
+    async fn invalidate(&self) {
+        let Self::Web(tokens) = self;
+        let _ = tokens.access_token(true).await;
+    }
+}
+
+/// The Web API grant, refreshed and persisted as it ages.
+pub struct WebTokens {
+    http: reqwest::Client,
+    token: tokio::sync::Mutex<crate::auth::StoredToken>,
+    path: std::path::PathBuf,
+}
+
+impl WebTokens {
+    pub fn new(
+        http: reqwest::Client,
+        token: crate::auth::StoredToken,
+        path: std::path::PathBuf,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            http,
+            token: tokio::sync::Mutex::new(token),
+            path,
+        })
+    }
+
+    /// A valid access token, refreshing first when it is close to expiry or
+    /// `force` asks for a fresh one after a 401.
+    async fn access_token(&self, force: bool) -> Result<String> {
+        let mut guard = self.token.lock().await;
+        if force || guard.needs_refresh() {
+            let client_id = guard.client_id.clone();
+            let refresh_token = guard.refresh_token.clone();
+            match crate::auth::refresh(&self.http, &client_id, &refresh_token).await {
+                Ok(response) => match crate::auth::StoredToken::from_response(
+                    &client_id,
+                    response,
+                    Some(&refresh_token),
+                ) {
+                    Ok(updated) => {
+                        let _ = updated.save(&self.path);
+                        *guard = updated;
+                    }
+                    Err(error) => {
+                        log::warn!("token refresh returned an unusable response: {error}")
+                    }
+                },
+                Err(error) => {
+                    // A hard refresh failure means the grant is gone.
+                    if force || guard.needs_refresh() {
+                        return Err(ApiError::SignInExpired(error.to_string()));
+                    }
+                    log::warn!("token refresh failed, using the current token: {error}");
+                }
+            }
+        }
+        Ok(guard.access_token.clone())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryStyle {
+    Modern,
+    Classic,
+}
+
+/// What to start playing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlayRequest {
+    pub context_uri: Option<String>,
+    pub uris: Vec<String>,
+    pub offset_uri: Option<String>,
+    pub offset_position: Option<u32>,
+    pub position_ms: u32,
+}
+
+impl PlayRequest {
+    pub fn context(uri: impl Into<String>) -> Self {
+        Self {
+            context_uri: Some(uri.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn tracks(uris: Vec<String>) -> Self {
+        Self {
+            uris,
+            ..Self::default()
+        }
+    }
+
+    pub fn starting_at_uri(mut self, uri: impl Into<String>) -> Self {
+        self.offset_uri = Some(uri.into());
+        self
+    }
+
+    pub fn starting_at_index(mut self, index: u32) -> Self {
+        self.offset_position = Some(index);
+        self
+    }
+
+    fn body(&self) -> Value {
+        let mut body = serde_json::Map::new();
+        if let Some(context) = &self.context_uri {
+            body.insert("context_uri".into(), json!(context));
+        } else if !self.uris.is_empty() {
+            body.insert("uris".into(), json!(self.uris));
+        }
+        if let Some(uri) = &self.offset_uri {
+            body.insert("offset".into(), json!({ "uri": uri }));
+        } else if let Some(position) = self.offset_position {
+            body.insert("offset".into(), json!({ "position": position }));
+        }
+        if self.position_ms > 0 {
+            body.insert("position_ms".into(), json!(self.position_ms));
+        }
+        Value::Object(body)
+    }
+}
+
+pub struct ApiClient {
+    http: reqwest::Client,
+    tokens: Mutex<Option<TokenProvider>>,
+    limiter: Semaphore,
+    library_style: AtomicU8,
+    search_limit: AtomicU32,
+}
+
+impl ApiClient {
+    pub fn new(http: reqwest::Client) -> Self {
+        Self {
+            http,
+            tokens: Mutex::new(None),
+            limiter: Semaphore::new(MAX_IN_FLIGHT),
+            library_style: AtomicU8::new(LibraryStyle::Modern as u8),
+            search_limit: AtomicU32::new(20),
+        }
+    }
+
+    pub fn set_token_provider(&self, provider: Option<TokenProvider>) {
+        *self.tokens.lock().unwrap_or_else(|p| p.into_inner()) = provider;
+    }
+
+    fn provider(&self) -> Result<TokenProvider> {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or(ApiError::NotSignedIn)
+    }
+
+    fn style(&self) -> LibraryStyle {
+        if self.library_style.load(Ordering::Relaxed) == LibraryStyle::Classic as u8 {
+            LibraryStyle::Classic
+        } else {
+            LibraryStyle::Modern
+        }
+    }
+
+    fn set_style(&self, style: LibraryStyle) {
+        log::info!("switching library endpoint style to {style:?}");
+        self.library_style.store(style as u8, Ordering::Relaxed);
+    }
+
+    // ---- transport -------------------------------------------------------
+
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<Option<Value>> {
+        let url = if path.starts_with("http") {
+            path.to_string()
+        } else {
+            format!("{BASE_URL}{path}")
+        };
+        let provider = self.provider()?;
+        let _permit = self
+            .limiter
+            .acquire()
+            .await
+            .map_err(|_| ApiError::NotSignedIn)?;
+
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let token = provider.access_token().await?;
+            let mut request = self
+                .http
+                .request(method.clone(), &url)
+                .bearer_auth(&token)
+                .query(query);
+            if let Some(body) = body {
+                request = request.json(body);
+            } else if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
+                request = request.header(reqwest::header::CONTENT_LENGTH, "0");
+            }
+            let response = request.send().await?;
+            let status = response.status();
+
+            if status == StatusCode::UNAUTHORIZED && attempt == 1 {
+                // The access token was rejected; force a refresh and retry once.
+                provider.invalidate().await;
+                continue;
+            }
+            if status == StatusCode::TOO_MANY_REQUESTS && attempt <= RATE_LIMIT_RETRIES {
+                let wait = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map_or(Duration::from_secs(1), Duration::from_secs)
+                    .min(MAX_RETRY_AFTER);
+                log::warn!("rate limited on {path}; waiting {wait:?}");
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            if status.is_server_error() && attempt == 1 {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                continue;
+            }
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err(ApiError::RateLimited);
+            }
+            let text = response.text().await?;
+            if status.is_success() {
+                if text.trim().is_empty() {
+                    return Ok(None);
+                }
+                return serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|error| ApiError::Decode(error.to_string()));
+            }
+            let message = serde_json::from_str::<ApiErrorBody>(&text)
+                .ok()
+                .map(|body| body.error.message)
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("request failed")
+                        .to_string()
+                });
+            return Err(ApiError::Status {
+                status: status.as_u16(),
+                message,
+            });
+        }
+    }
+
+    async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
+        let value = self
+            .send(Method::GET, path, query, None)
+            .await?
+            .unwrap_or(Value::Null);
+        serde_json::from_value(value).map_err(|error| ApiError::Decode(error.to_string()))
+    }
+
+    async fn get_optional<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Option<T>> {
+        match self.send(Method::GET, path, query, None).await? {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value(value)
+                .map(Some)
+                .map_err(|error| ApiError::Decode(error.to_string())),
+        }
+    }
+
+    async fn write(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<Option<Value>> {
+        self.send(method, path, query, body).await
+    }
+
+    // ---- identity and player ---------------------------------------------
+
+    pub async fn me(&self) -> Result<User> {
+        self.get("/me", &[]).await
+    }
+
+    pub async fn devices(&self) -> Result<Vec<Device>> {
+        let list: DeviceList = self.get("/me/player/devices", &[]).await?;
+        Ok(list.devices)
+    }
+
+    pub async fn playback_state(&self) -> Result<Option<PlaybackState>> {
+        self.get_optional(
+            "/me/player",
+            &[("additional_types", "track,episode".to_string())],
+        )
+        .await
+    }
+
+    pub async fn queue(&self) -> Result<Queue> {
+        self.get("/me/player/queue", &[]).await
+    }
+
+    pub async fn recently_played(&self, limit: u32) -> Result<CursorPage<PlayHistory>> {
+        self.get(
+            "/me/player/recently-played",
+            &[("limit", limit.to_string())],
+        )
+        .await
+    }
+
+    fn device_query(device_id: Option<&str>) -> Vec<(&'static str, String)> {
+        device_id
+            .map(|id| vec![("device_id", id.to_string())])
+            .unwrap_or_default()
+    }
+
+    pub async fn play(&self, device_id: Option<&str>, request: Option<&PlayRequest>) -> Result<()> {
+        let body = request.map(PlayRequest::body);
+        self.write(
+            Method::PUT,
+            "/me/player/play",
+            &Self::device_query(device_id),
+            body.as_ref(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pause(&self, device_id: Option<&str>) -> Result<()> {
+        self.write(
+            Method::PUT,
+            "/me/player/pause",
+            &Self::device_query(device_id),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn next(&self, device_id: Option<&str>) -> Result<()> {
+        self.write(
+            Method::POST,
+            "/me/player/next",
+            &Self::device_query(device_id),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn previous(&self, device_id: Option<&str>) -> Result<()> {
+        self.write(
+            Method::POST,
+            "/me/player/previous",
+            &Self::device_query(device_id),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn seek(&self, position_ms: u32, device_id: Option<&str>) -> Result<()> {
+        let mut query = Self::device_query(device_id);
+        query.push(("position_ms", position_ms.to_string()));
+        self.write(Method::PUT, "/me/player/seek", &query, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_volume(&self, percent: u8, device_id: Option<&str>) -> Result<()> {
+        let mut query = Self::device_query(device_id);
+        query.push(("volume_percent", percent.min(100).to_string()));
+        self.write(Method::PUT, "/me/player/volume", &query, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_shuffle(&self, state: bool, device_id: Option<&str>) -> Result<()> {
+        let mut query = Self::device_query(device_id);
+        query.push(("state", state.to_string()));
+        self.write(Method::PUT, "/me/player/shuffle", &query, None)
+            .await?;
+        Ok(())
+    }
+
+    /// `state` is `off`, `context`, or `track`.
+    pub async fn set_repeat(&self, state: &str, device_id: Option<&str>) -> Result<()> {
+        let mut query = Self::device_query(device_id);
+        query.push(("state", state.to_string()));
+        self.write(Method::PUT, "/me/player/repeat", &query, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn transfer(&self, device_id: &str, play: bool) -> Result<()> {
+        let body = json!({ "device_ids": [device_id], "play": play });
+        self.write(Method::PUT, "/me/player", &[], Some(&body))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn add_to_queue(&self, uri: &str, device_id: Option<&str>) -> Result<()> {
+        let mut query = Self::device_query(device_id);
+        query.push(("uri", uri.to_string()));
+        self.write(Method::POST, "/me/player/queue", &query, None)
+            .await?;
+        Ok(())
+    }
+
+    // ---- playlists ---------------------------------------------------------
+
+    pub async fn my_playlists(&self, offset: u32, limit: u32) -> Result<Page<Playlist>> {
+        self.get(
+            "/me/playlists",
+            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+        )
+        .await
+    }
+
+    pub async fn playlist(&self, id: &str) -> Result<Playlist> {
+        self.get(&format!("/playlists/{id}"), &[]).await
+    }
+
+    fn playlist_items_path(&self, id: &str, style: LibraryStyle) -> String {
+        match style {
+            LibraryStyle::Modern => format!("/playlists/{id}/items"),
+            LibraryStyle::Classic => format!("/playlists/{id}/tracks"),
+        }
+    }
+
+    /// Runs `call` with the current endpoint style, switching styles once when
+    /// Spotify says the endpoint does not exist.
+    async fn with_style_fallback<T, F, Fut>(&self, call: F) -> Result<T>
+    where
+        F: Fn(LibraryStyle) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let style = self.style();
+        match call(style).await {
+            Err(error) if error.is_gone() => {
+                let other = match style {
+                    LibraryStyle::Modern => LibraryStyle::Classic,
+                    LibraryStyle::Classic => LibraryStyle::Modern,
+                };
+                match call(other).await {
+                    Ok(value) => {
+                        self.set_style(other);
+                        Ok(value)
+                    }
+                    Err(_) => Err(error),
+                }
+            }
+            result => result,
+        }
+    }
+
+    pub async fn playlist_items(
+        &self,
+        id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Page<PlaylistItem>> {
+        self.with_style_fallback(|style| async move {
+            self.get(
+                &self.playlist_items_path(id, style),
+                &[
+                    ("limit", limit.to_string()),
+                    ("offset", offset.to_string()),
+                    ("additional_types", "track,episode".to_string()),
+                ],
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn create_playlist(
+        &self,
+        user_id: &str,
+        name: &str,
+        public: bool,
+        description: &str,
+    ) -> Result<Playlist> {
+        let body = json!({ "name": name, "public": public, "description": description });
+        let value = self
+            .write(
+                Method::POST,
+                &format!("/users/{user_id}/playlists"),
+                &[],
+                Some(&body),
+            )
+            .await?
+            .unwrap_or(Value::Null);
+        serde_json::from_value(value).map_err(|error| ApiError::Decode(error.to_string()))
+    }
+
+    pub async fn update_playlist(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        public: Option<bool>,
+    ) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        if let Some(name) = name {
+            body.insert("name".into(), json!(name));
+        }
+        if let Some(description) = description {
+            body.insert("description".into(), json!(description));
+        }
+        if let Some(public) = public {
+            body.insert("public".into(), json!(public));
+        }
+        self.write(
+            Method::PUT,
+            &format!("/playlists/{id}"),
+            &[],
+            Some(&Value::Object(body)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn add_playlist_items(
+        &self,
+        id: &str,
+        uris: &[String],
+        position: Option<u32>,
+    ) -> Result<Option<String>> {
+        let mut body = json!({ "uris": uris });
+        if let Some(position) = position {
+            body["position"] = json!(position);
+        }
+        let value = self
+            .with_style_fallback(|style| {
+                let body = body.clone();
+                async move {
+                    self.write(
+                        Method::POST,
+                        &self.playlist_items_path(id, style),
+                        &[],
+                        Some(&body),
+                    )
+                    .await
+                }
+            })
+            .await?;
+        Ok(Self::snapshot(value))
+    }
+
+    pub async fn remove_playlist_items(
+        &self,
+        id: &str,
+        uris: &[String],
+        snapshot_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let value = self
+            .with_style_fallback(|style| async move {
+                let entries: Vec<Value> = uris.iter().map(|uri| json!({ "uri": uri })).collect();
+                let mut body = match style {
+                    LibraryStyle::Modern => json!({ "items": entries }),
+                    LibraryStyle::Classic => json!({ "tracks": entries }),
+                };
+                if let Some(snapshot) = snapshot_id {
+                    body["snapshot_id"] = json!(snapshot);
+                }
+                self.write(
+                    Method::DELETE,
+                    &self.playlist_items_path(id, style),
+                    &[],
+                    Some(&body),
+                )
+                .await
+            })
+            .await?;
+        Ok(Self::snapshot(value))
+    }
+
+    pub async fn reorder_playlist(
+        &self,
+        id: &str,
+        range_start: u32,
+        insert_before: u32,
+        snapshot_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let value = self
+            .with_style_fallback(|style| async move {
+                let mut body = json!({
+                    "range_start": range_start,
+                    "insert_before": insert_before,
+                    "range_length": 1,
+                });
+                if let Some(snapshot) = snapshot_id {
+                    body["snapshot_id"] = json!(snapshot);
+                }
+                self.write(
+                    Method::PUT,
+                    &self.playlist_items_path(id, style),
+                    &[],
+                    Some(&body),
+                )
+                .await
+            })
+            .await?;
+        Ok(Self::snapshot(value))
+    }
+
+    fn snapshot(value: Option<Value>) -> Option<String> {
+        value
+            .and_then(|value| serde_json::from_value::<SnapshotId>(value).ok())
+            .and_then(|snapshot| snapshot.snapshot_id)
+    }
+
+    pub async fn follow_playlist(&self, id: &str) -> Result<()> {
+        self.with_style_fallback(|style| async move {
+            match style {
+                LibraryStyle::Modern => {
+                    self.write(
+                        Method::PUT,
+                        "/me/library",
+                        &[("uris", format!("spotify:playlist:{id}"))],
+                        None,
+                    )
+                    .await
+                }
+                LibraryStyle::Classic => {
+                    self.write(
+                        Method::PUT,
+                        &format!("/playlists/{id}/followers"),
+                        &[],
+                        Some(&json!({ "public": false })),
+                    )
+                    .await
+                }
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn unfollow_playlist(&self, id: &str) -> Result<()> {
+        self.with_style_fallback(|style| async move {
+            match style {
+                LibraryStyle::Modern => {
+                    self.write(
+                        Method::DELETE,
+                        "/me/library",
+                        &[("uris", format!("spotify:playlist:{id}"))],
+                        None,
+                    )
+                    .await
+                }
+                LibraryStyle::Classic => {
+                    self.write(
+                        Method::DELETE,
+                        &format!("/playlists/{id}/followers"),
+                        &[],
+                        None,
+                    )
+                    .await
+                }
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    // ---- library -----------------------------------------------------------
+
+    pub async fn saved_tracks(&self, offset: u32, limit: u32) -> Result<Page<SavedTrack>> {
+        self.get(
+            "/me/tracks",
+            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+        )
+        .await
+    }
+
+    pub async fn saved_albums(&self, offset: u32, limit: u32) -> Result<Page<SavedAlbum>> {
+        self.get(
+            "/me/albums",
+            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+        )
+        .await
+    }
+
+    pub async fn followed_artists(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<CursorPage<Artist>> {
+        let mut query = vec![("type", "artist".to_string()), ("limit", limit.to_string())];
+        if let Some(after) = after {
+            query.push(("after", after.to_string()));
+        }
+        let followed: FollowedArtists = self.get("/me/following", &query).await?;
+        Ok(followed.artists)
+    }
+
+    pub async fn saved_shows(&self, offset: u32, limit: u32) -> Result<Page<SavedShow>> {
+        self.get(
+            "/me/shows",
+            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+        )
+        .await
+    }
+
+    pub async fn saved_episodes(&self, offset: u32, limit: u32) -> Result<Page<SavedEpisode>> {
+        self.get(
+            "/me/episodes",
+            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+        )
+        .await
+    }
+
+    pub async fn top_tracks(&self, time_range: &str, limit: u32) -> Result<Page<Track>> {
+        self.get(
+            "/me/top/tracks",
+            &[
+                ("limit", limit.to_string()),
+                ("time_range", time_range.to_string()),
+            ],
+        )
+        .await
+    }
+
+    pub async fn top_artists(&self, time_range: &str, limit: u32) -> Result<Page<Artist>> {
+        self.get(
+            "/me/top/artists",
+            &[
+                ("limit", limit.to_string()),
+                ("time_range", time_range.to_string()),
+            ],
+        )
+        .await
+    }
+
+    fn classic_library_path(uri: &str) -> Option<(&'static str, Vec<(&'static str, String)>)> {
+        let mut parts = uri.split(':');
+        let (_, kind, id) = (parts.next()?, parts.next()?, parts.next()?);
+        let id = id.to_string();
+        Some(match kind {
+            "track" => ("/me/tracks", vec![("ids", id)]),
+            "album" => ("/me/albums", vec![("ids", id)]),
+            "show" => ("/me/shows", vec![("ids", id)]),
+            "episode" => ("/me/episodes", vec![("ids", id)]),
+            "artist" => (
+                "/me/following",
+                vec![("type", "artist".to_string()), ("ids", id)],
+            ),
+            _ => return None,
+        })
+    }
+
+    async fn library_write(&self, method: Method, uris: &[String]) -> Result<()> {
+        self.with_style_fallback(|style| {
+            let method = method.clone();
+            async move {
+                match style {
+                    LibraryStyle::Modern => {
+                        self.write(method, "/me/library", &[("uris", uris.join(","))], None)
+                            .await
+                    }
+                    LibraryStyle::Classic => {
+                        for uri in uris {
+                            if uri.starts_with("spotify:playlist:") {
+                                let id = uri.rsplit(':').next().unwrap_or_default();
+                                let path = format!("/playlists/{id}/followers");
+                                self.write(method.clone(), &path, &[], None).await?;
+                                continue;
+                            }
+                            let Some((path, query)) = Self::classic_library_path(uri) else {
+                                continue;
+                            };
+                            self.write(method.clone(), path, &query, None).await?;
+                        }
+                        Ok(None)
+                    }
+                }
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Saves tracks, albums, artists, shows, episodes, or playlists.
+    pub async fn save(&self, uris: &[String]) -> Result<()> {
+        self.library_write(Method::PUT, uris).await
+    }
+
+    pub async fn unsave(&self, uris: &[String]) -> Result<()> {
+        self.library_write(Method::DELETE, uris).await
+    }
+
+    /// Whether each URI is in the library, in the same order as `uris`.
+    pub async fn contains(&self, uris: &[String], user_id: &str) -> Result<Vec<bool>> {
+        self.with_style_fallback(|style| async move {
+            match style {
+                LibraryStyle::Modern => {
+                    self.get("/me/library/contains", &[("uris", uris.join(","))])
+                        .await
+                }
+                LibraryStyle::Classic => {
+                    let mut result = Vec::with_capacity(uris.len());
+                    for uri in uris {
+                        if uri.starts_with("spotify:playlist:") {
+                            let id = uri.rsplit(':').next().unwrap_or_default();
+                            let flags: Vec<bool> = self
+                                .get(
+                                    &format!("/playlists/{id}/followers/contains"),
+                                    &[("ids", user_id.to_string())],
+                                )
+                                .await?;
+                            result.push(flags.first().copied().unwrap_or(false));
+                            continue;
+                        }
+                        let Some((path, query)) = Self::classic_library_path(uri) else {
+                            result.push(false);
+                            continue;
+                        };
+                        let flags: Vec<bool> =
+                            self.get(&format!("{path}/contains"), &query).await?;
+                        result.push(flags.first().copied().unwrap_or(false));
+                    }
+                    Ok(result)
+                }
+            }
+        })
+        .await
+    }
+
+    // ---- catalog -----------------------------------------------------------
+
+    pub async fn search(&self, query: &str, types: &[&str]) -> Result<SearchResults> {
+        let limit = self.search_limit.load(Ordering::Relaxed);
+        let run = |limit: u32| async move {
+            self.get(
+                "/search",
+                &[
+                    ("q", query.to_string()),
+                    ("type", types.join(",")),
+                    ("limit", limit.to_string()),
+                ],
+            )
+            .await
+        };
+        match run(limit).await {
+            Err(error) if limit > 10 && matches!(error.status(), Some(400) | Some(403)) => {
+                self.search_limit.store(10, Ordering::Relaxed);
+                run(10).await
+            }
+            result => result,
+        }
+    }
+
+    pub async fn artist(&self, id: &str) -> Result<Artist> {
+        self.get(&format!("/artists/{id}"), &[]).await
+    }
+
+    /// The artist's most popular tracks. Spotify has retired this endpoint for
+    /// newer applications, so a catalog search ranked by popularity stands in
+    /// when it is unavailable.
+    pub async fn artist_top_tracks(&self, id: &str, name: &str) -> Result<Vec<Track>> {
+        match self
+            .get::<TopTracks>(&format!("/artists/{id}/top-tracks"), &[])
+            .await
+        {
+            Ok(top) => Ok(top.tracks),
+            Err(error) if error.is_gone() || error.status() == Some(403) => {
+                let results = self
+                    .search(&format!("artist:\"{name}\""), &["track"])
+                    .await?;
+                let mut tracks: Vec<Track> = results
+                    .tracks
+                    .map(|page| page.items)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|track| {
+                        track
+                            .artists
+                            .iter()
+                            .any(|artist| artist.id.as_deref() == Some(id))
+                    })
+                    .collect();
+                tracks.sort_by_key(|track| std::cmp::Reverse(track.popularity));
+                Ok(tracks)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn artist_albums(
+        &self,
+        id: &str,
+        include_groups: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Page<Album>> {
+        self.get(
+            &format!("/artists/{id}/albums"),
+            &[
+                ("include_groups", include_groups.to_string()),
+                ("limit", limit.to_string()),
+                ("offset", offset.to_string()),
+            ],
+        )
+        .await
+    }
+
+    pub async fn related_artists(&self, id: &str) -> Result<Vec<Artist>> {
+        let related: RelatedArtists = self
+            .get(&format!("/artists/{id}/related-artists"), &[])
+            .await?;
+        Ok(related.artists)
+    }
+
+    pub async fn album(&self, id: &str) -> Result<Album> {
+        self.get(&format!("/albums/{id}"), &[]).await
+    }
+
+    pub async fn album_tracks(&self, id: &str, offset: u32, limit: u32) -> Result<Page<Track>> {
+        self.get(
+            &format!("/albums/{id}/tracks"),
+            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+        )
+        .await
+    }
+
+    pub async fn show(&self, id: &str) -> Result<Show> {
+        self.get(&format!("/shows/{id}"), &[]).await
+    }
+
+    pub async fn show_episodes(&self, id: &str, offset: u32, limit: u32) -> Result<Page<Episode>> {
+        self.get(
+            &format!("/shows/{id}/episodes"),
+            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+        )
+        .await
+    }
+
+    pub async fn track(&self, id: &str) -> Result<Track> {
+        self.get(&format!("/tracks/{id}"), &[]).await
+    }
+
+    pub async fn recommendations(
+        &self,
+        seed_tracks: &[String],
+        seed_artists: &[String],
+        limit: u32,
+    ) -> Result<Vec<Track>> {
+        let mut query = vec![("limit", limit.to_string())];
+        if !seed_tracks.is_empty() {
+            query.push(("seed_tracks", seed_tracks.join(",")));
+        }
+        if !seed_artists.is_empty() {
+            query.push(("seed_artists", seed_artists.join(",")));
+        }
+        let recommendations: Recommendations = self.get("/recommendations", &query).await?;
+        Ok(recommendations.tracks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_request_body_shapes() {
+        let context = PlayRequest::context("spotify:album:x").starting_at_uri("spotify:track:y");
+        assert_eq!(
+            context.body(),
+            json!({ "context_uri": "spotify:album:x", "offset": { "uri": "spotify:track:y" } })
+        );
+        let tracks = PlayRequest::tracks(vec!["spotify:track:a".into()]).starting_at_index(0);
+        assert_eq!(
+            tracks.body(),
+            json!({ "uris": ["spotify:track:a"], "offset": { "position": 0 } })
+        );
+    }
+
+    #[test]
+    fn classic_library_paths() {
+        let (path, query) = ApiClient::classic_library_path("spotify:artist:abc").unwrap();
+        assert_eq!(path, "/me/following");
+        assert_eq!(query[1], ("ids", "abc".to_string()));
+        assert!(ApiClient::classic_library_path("spotify:user:abc").is_none());
+    }
+
+    #[test]
+    fn gone_errors_trigger_fallback() {
+        assert!(
+            ApiError::Status {
+                status: 404,
+                message: String::new()
+            }
+            .is_gone()
+        );
+        assert!(
+            !ApiError::Status {
+                status: 500,
+                message: String::new()
+            }
+            .is_gone()
+        );
+        assert!(!ApiError::RateLimited.is_gone());
+    }
+}
