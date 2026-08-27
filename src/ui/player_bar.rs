@@ -36,84 +36,85 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             let now = app.now_playing();
             let width = rect.width();
             let side = (width * 0.3).clamp(200.0, 420.0);
-            // Each region is a full-width band whose height matches its
-            // content, vertically centred in the bar. `Align::Center` only
-            // centres items against each other, not within a taller rect, so
-            // the band has to be sized to the content or it floats to the top.
-            let band = |left_edge: f32, w: f32, height: f32| {
-                Rect::from_min_size(
-                    pos2(left_edge, rect.center().y - height / 2.0),
-                    vec2(w, height),
-                )
-            };
-            let left = band(rect.left(), side, 56.0);
-            let right = band(rect.right() - side, side, 40.0);
+            let cy = rect.center().y;
+            let left = Rect::from_min_max(rect.min, pos2(rect.left() + side, rect.bottom()));
             let center = Rect::from_min_max(
                 pos2(rect.left() + side, rect.top()),
                 pos2(rect.right() - side, rect.bottom()),
             );
 
-            let mut left_ui = ui.new_child(
-                UiBuilder::new()
-                    .max_rect(left)
-                    .layout(Layout::left_to_right(Align::Center)),
-            );
-            now_playing_block(app, &mut left_ui, now.as_ref());
+            // egui's cross-axis centring is unreliable across nested layouts of
+            // mixed heights, so each region is placed in an explicit band that
+            // is sized to its content and centred on the bar's midline.
+            now_playing_block(app, ui, left, now.as_ref());
 
+            let center_band =
+                Rect::from_min_size(pos2(center.left(), cy - 29.0), vec2(center.width(), 58.0));
             let mut center_ui = ui.new_child(
                 UiBuilder::new()
-                    .max_rect(center)
+                    .max_rect(center_band)
                     .layout(Layout::top_down(Align::Center)),
             );
             transport(app, &mut center_ui, now.as_ref(), center.width());
 
+            let right_band =
+                Rect::from_min_size(pos2(rect.right() - side, cy - 15.0), vec2(side, 30.0));
             let mut right_ui = ui.new_child(
                 UiBuilder::new()
-                    .max_rect(right)
+                    .max_rect(right_band)
                     .layout(Layout::right_to_left(Align::Center)),
             );
             extras(app, &mut right_ui, now.as_ref());
         });
 }
 
-fn now_playing_block(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>) {
+fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option<&NowPlaying>) {
     let palette = app.palette;
-    ui.spacing_mut().item_spacing.x = 12.0;
+    let cy = region.center().y;
+    let cover_rect = Rect::from_min_size(pos2(region.left() + 4.0, cy - 28.0), Vec2::splat(56.0));
+
     let Some(now) = now else {
-        ui.add_space(4.0);
-        super::widgets::cover(ui, &palette, None, 56.0, 6.0, Icon::Music);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            theme::text(
-                ui,
-                "Nothing playing",
-                theme::medium(14.0),
-                palette.secondary,
-            );
-            theme::text(
-                ui,
-                "Pick a song, album, or playlist",
-                theme::regular(12.0),
-                palette.dim,
-            );
-        });
+        super::widgets::paint_cover(ui, &palette, None, cover_rect, 6.0, Icon::Music);
+        let text_left = cover_rect.right() + 12.0;
+        let text_rect = Rect::from_min_size(
+            pos2(text_left, cy - 17.0),
+            vec2((region.right() - text_left - 8.0).max(40.0), 34.0),
+        );
+        let mut text_ui = ui.new_child(
+            UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        text_ui.spacing_mut().item_spacing.y = 2.0;
+        theme::text(
+            &mut text_ui,
+            "Nothing playing",
+            theme::medium(14.0),
+            palette.secondary,
+        );
+        theme::text(
+            &mut text_ui,
+            "Pick a song, album, or playlist",
+            theme::regular(12.0),
+            palette.dim,
+        );
         return;
     };
-    ui.add_space(4.0);
-    let cover_rect = super::widgets::cover(
+
+    super::widgets::paint_cover(
         ui,
         &palette,
         now.art_small.as_deref().or(now.art_url.as_deref()),
-        56.0,
+        cover_rect,
         6.0,
         Icon::Music,
     );
-    let cover_response = ui.interact(
-        cover_rect,
-        egui::Id::new("now-playing-cover"),
-        Sense::click(),
-    );
-    if cover_response
+    if ui
+        .interact(
+            cover_rect,
+            egui::Id::new("now-playing-cover"),
+            Sense::click(),
+        )
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
     {
@@ -123,27 +124,40 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>)
             app.actions.push(Action::Open(Page::Show(id.clone())));
         }
     }
-    let text_width = (ui.available_width() - 48.0).max(60.0);
-    ui.vertical(|ui| {
-        ui.set_max_width(text_width);
-        ui.spacing_mut().item_spacing.y = 2.0;
-        let title = theme::link(ui, &now.title, theme::medium(14.0), palette.text);
-        if title.clicked() {
-            if let Some(id) = &now.album_id {
-                app.actions.push(Action::Open(Page::Album(id.clone())));
-            } else if let Some(id) = &now.show_id {
-                app.actions.push(Action::Open(Page::Show(id.clone())));
-            }
+
+    let heart_width = if now.is_episode { 0.0 } else { 42.0 };
+    let text_left = cover_rect.right() + 12.0;
+    let text_width = (region.right() - text_left - heart_width).max(40.0);
+    let text_rect = Rect::from_min_size(pos2(text_left, cy - 18.0), vec2(text_width, 36.0));
+    let mut text_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    text_ui.set_clip_rect(text_rect.intersect(ui.clip_rect()));
+    text_ui.spacing_mut().item_spacing.y = 2.0;
+    if theme::link(&mut text_ui, &now.title, theme::medium(14.0), palette.text).clicked() {
+        if let Some(id) = &now.album_id {
+            app.actions.push(Action::Open(Page::Album(id.clone())));
+        } else if let Some(id) = &now.show_id {
+            app.actions.push(Action::Open(Page::Show(id.clone())));
         }
-        let artist = theme::link(ui, &now.subtitle, theme::regular(12.0), palette.secondary);
-        if artist.clicked() {
-            if let Some(id) = now.artists.first().and_then(|artist| artist.id.clone()) {
-                app.actions.push(Action::Open(Page::Artist(id)));
-            } else if let Some(id) = &now.show_id {
-                app.actions.push(Action::Open(Page::Show(id.clone())));
-            }
+    }
+    if theme::link(
+        &mut text_ui,
+        &now.subtitle,
+        theme::regular(12.0),
+        palette.secondary,
+    )
+    .clicked()
+    {
+        if let Some(id) = now.artists.first().and_then(|artist| artist.id.clone()) {
+            app.actions.push(Action::Open(Page::Artist(id)));
+        } else if let Some(id) = &now.show_id {
+            app.actions.push(Action::Open(Page::Show(id.clone())));
         }
-    });
+    }
+
     if !now.is_episode {
         let saved = app.is_saved(&now.uri).unwrap_or(false);
         let (icon, color, tooltip) = if saved {
@@ -151,7 +165,27 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>)
         } else {
             (Icon::Heart, palette.secondary, "Save to Liked Songs")
         };
-        if theme::icon_button(ui, icon, 17.0, color, palette.text, tooltip).clicked() {
+        // Sit the heart just past the actual text, not at the region's far
+        // edge, so it stays visually attached to the title.
+        let natural = {
+            let title =
+                ui.painter()
+                    .layout_no_wrap(now.title.clone(), theme::medium(14.0), palette.text);
+            let subtitle = ui.painter().layout_no_wrap(
+                now.subtitle.clone(),
+                theme::regular(12.0),
+                palette.secondary,
+            );
+            title.size().x.max(subtitle.size().x).min(text_width)
+        };
+        let heart_x = (text_left + natural + 21.0).min(region.right() - 21.0);
+        let heart_rect = Rect::from_center_size(pos2(heart_x, cy), Vec2::splat(30.0));
+        let mut heart_ui = ui.new_child(
+            UiBuilder::new()
+                .max_rect(heart_rect)
+                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+        );
+        if theme::icon_button(&mut heart_ui, icon, 17.0, color, palette.text, tooltip).clicked() {
             app.actions.push(Action::ToggleSaved(now.uri.clone()));
         }
     }
@@ -159,9 +193,11 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>)
 
 fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, width: f32) {
     let palette = app.palette;
-    // Lead so the play button's centre lands on the bar's vertical centre,
-    // level with the album cover on the left; the progress row sits below.
-    ui.add_space(26.0);
+    ui.set_width(width);
+    // The enclosing band is 58 tall and centred on the bar: a 36px control
+    // row, this 6px gap, and the 16px progress row fill it exactly, so the
+    // whole cluster reads as centred.
+    ui.spacing_mut().item_spacing.y = 0.0;
     let enabled = now.is_some_and(|now| now.can_control) || app.is_connected();
     let playing = now.is_some_and(|now| now.playing);
     let loading = now.is_some_and(|now| now.loading);
@@ -267,7 +303,7 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, width: 
             app.actions.push(Action::CycleRepeat);
         }
     });
-    ui.add_space(2.0);
+    ui.add_space(6.0);
     let slider_width = (width - 120.0).clamp(120.0, 620.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
