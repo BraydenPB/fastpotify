@@ -186,12 +186,16 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
 
 fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region: Rect) {
     let palette = app.palette;
-    // Everything here is placed with explicit rects: the five buttons sit on
-    // the bar's midline — the same line as the album cover, the like button,
-    // and the volume controls — and the progress row hangs just below them.
-    // egui's implicit rows centre each widget in the row height known when it
-    // is added, which left earlier icons riding high next to the play disc.
-    let cy = region.center().y;
+    // Everything here is placed with explicit rects: egui's implicit rows
+    // centre each widget in the row height known when it is added, which
+    // left earlier icons riding high next to the play disc.
+    //
+    // The buttons row (36) and the progress row (~15, after a 6px gap) form
+    // one cluster, centred as a group in the 88px bar: the buttons sit 8px
+    // above the bar's midline and the progress row 23px below it. Measured
+    // on screen this puts equal breathing room above and beneath the
+    // cluster.
+    let cy = region.center().y - 8.0;
     let enabled = now.is_some_and(|now| now.can_control) || app.is_connected();
     let playing = now.is_some_and(|now| now.playing);
     let loading = now.is_some_and(|now| now.loading);
@@ -324,10 +328,9 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
         app.actions.push(Action::CycleRepeat);
     }
 
-    // Progress row, just below the buttons. Chosen so the gaps read evenly:
-    // ~7px between the disc and the slider line, ~9px between the time text
-    // and the bar's bottom edge, matching the breathing room elsewhere.
-    let row_cy = cy + 27.0;
+    // Progress row, just below the buttons (disc bottom + 6px gap + half of
+    // the time text's line height).
+    let row_cy = cy + 31.0;
     let slider_width = (region.width() - 120.0).clamp(120.0, 620.0);
     let (position, duration) = now
         .map(|now| (now.position_ms, now.duration_ms))
