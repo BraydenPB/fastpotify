@@ -324,8 +324,10 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
         app.actions.push(Action::CycleRepeat);
     }
 
-    // Progress row, just below the buttons.
-    let row_cy = cy + 18.0 + 12.0;
+    // Progress row, just below the buttons. Chosen so the gaps read evenly:
+    // ~7px between the disc and the slider line, ~9px between the time text
+    // and the bar's bottom edge, matching the breathing room elsewhere.
+    let row_cy = cy + 27.0;
     let slider_width = (region.width() - 120.0).clamp(120.0, 620.0);
     let (position, duration) = now
         .map(|now| (now.position_ms, now.duration_ms))
