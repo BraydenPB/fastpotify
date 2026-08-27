@@ -48,14 +48,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             // is sized to its content and centred on the bar's midline.
             now_playing_block(app, ui, left, now.as_ref());
 
-            let center_band =
-                Rect::from_min_size(pos2(center.left(), cy - 29.0), vec2(center.width(), 58.0));
-            let mut center_ui = ui.new_child(
-                UiBuilder::new()
-                    .max_rect(center_band)
-                    .layout(Layout::top_down(Align::Center)),
-            );
-            transport(app, &mut center_ui, now.as_ref(), center.width());
+            transport(app, ui, now.as_ref(), center);
 
             let right_band =
                 Rect::from_min_size(pos2(rect.right() - side, cy - 15.0), vec2(side, 30.0));
@@ -191,13 +184,14 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     }
 }
 
-fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, width: f32) {
+fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region: Rect) {
     let palette = app.palette;
-    ui.set_width(width);
-    // The enclosing band is 58 tall and centred on the bar: a 36px control
-    // row, this 6px gap, and the 16px progress row fill it exactly, so the
-    // whole cluster reads as centred.
-    ui.spacing_mut().item_spacing.y = 0.0;
+    // Everything here is placed with explicit rects: the five buttons sit on
+    // the bar's midline — the same line as the album cover, the like button,
+    // and the volume controls — and the progress row hangs just below them.
+    // egui's implicit rows centre each widget in the row height known when it
+    // is added, which left earlier icons riding high next to the play disc.
+    let cy = region.center().y;
     let enabled = now.is_some_and(|now| now.can_control) || app.is_connected();
     let playing = now.is_some_and(|now| now.playing);
     let loading = now.is_some_and(|now| now.loading);
@@ -208,163 +202,188 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, width: 
     } else {
         palette.dim
     };
-    ui.horizontal(|ui| {
-        // Declare the row height up front: egui centres each item in the row
-        // height known at the time it is added, so without this the icons
-        // added before the 36px play circle would sit high.
-        ui.set_row_height(36.0);
-        ui.spacing_mut().item_spacing.x = 10.0;
-        let total = 4.0 * 30.0 + 36.0 + 4.0 * 10.0;
-        ui.add_space(((width - total) / 2.0).max(0.0));
-        let shuffle_color = if shuffle { palette.accent } else { dim };
-        if theme::icon_button(
-            ui,
-            Icon::Shuffle,
-            17.0,
-            shuffle_color,
-            if shuffle {
-                palette.accent_hover
-            } else {
-                palette.text
-            },
-            "Shuffle",
+
+    // Button widths: icon buttons occupy icon size + 12; the disc is 36.
+    let widths = [29.0, 30.0, 36.0, 30.0, 29.0];
+    let gap = 10.0;
+    let total: f32 = widths.iter().sum::<f32>() + gap * 4.0;
+    let mut x = region.center().x - total / 2.0;
+    let mut slot = |width: f32| {
+        let rect = Rect::from_center_size(pos2(x + width / 2.0, cy), vec2(width, 36.0));
+        x += width + gap;
+        rect
+    };
+    let centered = |ui: &mut egui::Ui, rect: Rect| {
+        ui.new_child(
+            UiBuilder::new()
+                .max_rect(rect)
+                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
         )
-        .clicked()
-        {
-            app.actions.push(Action::ToggleShuffle);
-        }
-        if theme::icon_button(
-            ui,
-            Icon::SkipBackFilled,
-            18.0,
-            dim,
+    };
+
+    let shuffle_color = if shuffle { palette.accent } else { dim };
+    let mut cell = centered(ui, slot(widths[0]));
+    if theme::icon_button(
+        &mut cell,
+        Icon::Shuffle,
+        17.0,
+        shuffle_color,
+        if shuffle {
+            palette.accent_hover
+        } else {
+            palette.text
+        },
+        "Shuffle",
+    )
+    .clicked()
+    {
+        app.actions.push(Action::ToggleShuffle);
+    }
+
+    let mut cell = centered(ui, slot(widths[1]));
+    if theme::icon_button(
+        &mut cell,
+        Icon::SkipBackFilled,
+        18.0,
+        dim,
+        palette.text,
+        "Previous",
+    )
+    .clicked()
+    {
+        app.actions.push(Action::Previous);
+    }
+
+    let disc = slot(widths[2]);
+    if loading {
+        ui.painter()
+            .circle_filled(disc.center(), 18.0, palette.text);
+        let mut cell = centered(ui, disc);
+        theme::spinner(&mut cell, 22.0, palette.window);
+    } else {
+        let icon = if playing {
+            Icon::PauseFilled
+        } else {
+            Icon::PlayFilled
+        };
+        let hover = if palette.dark {
+            egui::Color32::WHITE
+        } else {
+            palette.text
+        };
+        let mut cell = centered(ui, disc);
+        if theme::circle_button(
+            &mut cell,
+            icon,
+            36.0,
             palette.text,
-            "Previous",
+            hover,
+            palette.window,
+            if playing { "Pause" } else { "Play" },
         )
         .clicked()
         {
-            app.actions.push(Action::Previous);
+            app.actions.push(Action::TogglePlay);
         }
-        if loading {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
-            ui.painter()
-                .circle_filled(rect.center(), 18.0, palette.text);
-            let mut child = ui.new_child(
-                UiBuilder::new()
-                    .max_rect(rect)
-                    .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
-            );
-            theme::spinner(&mut child, 22.0, palette.window);
+    }
+
+    let mut cell = centered(ui, slot(widths[3]));
+    if theme::icon_button(
+        &mut cell,
+        Icon::SkipForwardFilled,
+        18.0,
+        dim,
+        palette.text,
+        "Next",
+    )
+    .clicked()
+    {
+        app.actions.push(Action::Next);
+    }
+
+    let (repeat_icon, repeat_color, tooltip) = match repeat {
+        RepeatMode::Off => (Icon::Repeat, dim, "Repeat"),
+        RepeatMode::Context => (Icon::Repeat, palette.accent, "Repeat one"),
+        RepeatMode::Track => (Icon::Repeat1, palette.accent, "Repeat off"),
+    };
+    let mut cell = centered(ui, slot(widths[4]));
+    if theme::icon_button(
+        &mut cell,
+        repeat_icon,
+        17.0,
+        repeat_color,
+        if repeat == RepeatMode::Off {
+            palette.text
         } else {
-            let icon = if playing {
-                Icon::PauseFilled
-            } else {
-                Icon::PlayFilled
-            };
-            let hover = if palette.dark {
-                egui::Color32::WHITE
-            } else {
-                palette.text
-            };
-            if theme::circle_button(
-                ui,
-                icon,
-                36.0,
-                palette.text,
-                hover,
-                palette.window,
-                if playing { "Pause" } else { "Play" },
-            )
-            .clicked()
-            {
-                app.actions.push(Action::TogglePlay);
+            palette.accent_hover
+        },
+        tooltip,
+    )
+    .clicked()
+    {
+        app.actions.push(Action::CycleRepeat);
+    }
+
+    // Progress row, just below the buttons.
+    let row_cy = cy + 18.0 + 12.0;
+    let slider_width = (region.width() - 120.0).clamp(120.0, 620.0);
+    let (position, duration) = now
+        .map(|now| (now.position_ms, now.duration_ms))
+        .unwrap_or((0, 0));
+    let shown_position = match app.seek_preview {
+        Some(fraction) => (fraction * duration as f32) as u32,
+        None => position,
+    };
+    let time_color = if now.is_some() {
+        palette.secondary
+    } else {
+        palette.dim
+    };
+    let slider_left = region.center().x - slider_width / 2.0;
+    ui.painter().text(
+        pos2(slider_left - 8.0, row_cy),
+        egui::Align2::RIGHT_CENTER,
+        util::format_duration_ms(shown_position),
+        theme::regular(11.5),
+        time_color,
+    );
+    let slider_rect =
+        Rect::from_center_size(pos2(region.center().x, row_cy), vec2(slider_width, 16.0));
+    let mut slider_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(slider_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    let fraction = if duration > 0 {
+        position as f32 / duration as f32
+    } else {
+        0.0
+    };
+    match thin_slider(
+        &mut slider_ui,
+        &palette,
+        egui::Id::new("seek-slider"),
+        fraction,
+        slider_width,
+        palette.accent,
+    ) {
+        SliderEvent::Dragging(value) => app.seek_preview = Some(value),
+        SliderEvent::Committed(value) => {
+            app.seek_preview = None;
+            if duration > 0 {
+                app.actions
+                    .push(Action::Seek((value * duration as f32) as u32));
             }
         }
-        if theme::icon_button(ui, Icon::SkipForwardFilled, 18.0, dim, palette.text, "Next")
-            .clicked()
-        {
-            app.actions.push(Action::Next);
-        }
-        let (repeat_icon, repeat_color, tooltip) = match repeat {
-            RepeatMode::Off => (Icon::Repeat, dim, "Repeat"),
-            RepeatMode::Context => (Icon::Repeat, palette.accent, "Repeat one"),
-            RepeatMode::Track => (Icon::Repeat1, palette.accent, "Repeat off"),
-        };
-        if theme::icon_button(
-            ui,
-            repeat_icon,
-            17.0,
-            repeat_color,
-            if repeat == RepeatMode::Off {
-                palette.text
-            } else {
-                palette.accent_hover
-            },
-            tooltip,
-        )
-        .clicked()
-        {
-            app.actions.push(Action::CycleRepeat);
-        }
-    });
-    ui.add_space(6.0);
-    let slider_width = (width - 120.0).clamp(120.0, 620.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        ui.add_space(((width - slider_width - 100.0) / 2.0).max(0.0));
-        let (position, duration) = now
-            .map(|now| (now.position_ms, now.duration_ms))
-            .unwrap_or((0, 0));
-        let preview = app.seek_preview;
-        let shown_position = match preview {
-            Some(fraction) => (fraction * duration as f32) as u32,
-            None => position,
-        };
-        let time_color = if now.is_some() {
-            palette.secondary
-        } else {
-            palette.dim
-        };
-        let (rect, _) = ui.allocate_exact_size(vec2(42.0, 16.0), Sense::hover());
-        ui.painter().text(
-            pos2(rect.right(), rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            util::format_duration_ms(shown_position),
-            theme::regular(11.5),
-            time_color,
-        );
-        let fraction = if duration > 0 {
-            position as f32 / duration as f32
-        } else {
-            0.0
-        };
-        match thin_slider(
-            ui,
-            &palette,
-            egui::Id::new("seek-slider"),
-            fraction,
-            slider_width,
-            palette.accent,
-        ) {
-            SliderEvent::Dragging(value) => app.seek_preview = Some(value),
-            SliderEvent::Committed(value) => {
-                app.seek_preview = None;
-                if duration > 0 {
-                    app.actions
-                        .push(Action::Seek((value * duration as f32) as u32));
-                }
-            }
-            SliderEvent::None => {}
-        }
-        let (rect, _) = ui.allocate_exact_size(vec2(42.0, 16.0), Sense::hover());
-        ui.painter().text(
-            pos2(rect.left(), rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            util::format_duration_ms(duration),
-            theme::regular(11.5),
-            time_color,
-        );
-    });
+        SliderEvent::None => {}
+    }
+    ui.painter().text(
+        pos2(slider_left + slider_width + 8.0, row_cy),
+        egui::Align2::LEFT_CENTER,
+        util::format_duration_ms(duration),
+        theme::regular(11.5),
+        time_color,
+    );
 }
 
 fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>) {
