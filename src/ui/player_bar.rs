@@ -36,14 +36,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             let now = app.now_playing();
             let width = rect.width();
             let side = (width * 0.3).clamp(200.0, 420.0);
-            let left = Rect::from_min_size(rect.min, vec2(side, rect.height()));
-            let right = Rect::from_min_size(
-                pos2(rect.right() - side, rect.top()),
-                vec2(side, rect.height()),
-            );
+            // Each region is a full-width band whose height matches its
+            // content, vertically centred in the bar. `Align::Center` only
+            // centres items against each other, not within a taller rect, so
+            // the band has to be sized to the content or it floats to the top.
+            let band = |left_edge: f32, w: f32, height: f32| {
+                Rect::from_min_size(
+                    pos2(left_edge, rect.center().y - height / 2.0),
+                    vec2(w, height),
+                )
+            };
+            let left = band(rect.left(), side, 56.0);
+            let right = band(rect.right() - side, side, 40.0);
             let center = Rect::from_min_max(
-                pos2(left.right(), rect.top()),
-                pos2(right.left(), rect.bottom()),
+                pos2(rect.left() + side, rect.top()),
+                pos2(rect.right() - side, rect.bottom()),
             );
 
             let mut left_ui = ui.new_child(
@@ -76,6 +83,7 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>)
         ui.add_space(4.0);
         super::widgets::cover(ui, &palette, None, 56.0, 6.0, Icon::Music);
         ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             theme::text(
                 ui,
                 "Nothing playing",
@@ -151,7 +159,9 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>)
 
 fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, width: f32) {
     let palette = app.palette;
-    ui.add_space(10.0);
+    // Lead so the play button's centre lands on the bar's vertical centre,
+    // level with the album cover on the left; the progress row sits below.
+    ui.add_space(26.0);
     let enabled = now.is_some_and(|now| now.can_control) || app.is_connected();
     let playing = now.is_some_and(|now| now.playing);
     let loading = now.is_some_and(|now| now.loading);
