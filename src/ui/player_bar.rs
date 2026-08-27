@@ -259,7 +259,7 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
     }
 
     let disc = slot(widths[2]);
-    if loading {
+    if loading || app.any_play_pending() {
         ui.painter()
             .circle_filled(disc.center(), 18.0, palette.text);
         let mut cell = centered(ui, disc);

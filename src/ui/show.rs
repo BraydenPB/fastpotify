@@ -43,7 +43,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 ui.spacing_mut().item_spacing.x = 18.0;
                 if let Some(latest) = page.episodes.items.first() {
                     let uri = latest.uri.clone();
-                    if theme::circle_button(
+                    if app.play_pending(&uri) {
+                        theme::circle_spinner(
+                            ui,
+                            56.0,
+                            palette.accent,
+                            palette.on_accent,
+                            "Starting…",
+                        );
+                    } else if theme::circle_button(
                         ui,
                         Icon::PlayFilled,
                         56.0,
@@ -214,7 +222,9 @@ pub fn episode_row(
     } else {
         Icon::PlayFilled
     };
-    if theme::circle_button(
+    if app.play_pending(&episode.uri) {
+        theme::circle_spinner(&mut child, 32.0, palette.text, palette.window, "Starting…");
+    } else if theme::circle_button(
         &mut child,
         icon,
         32.0,

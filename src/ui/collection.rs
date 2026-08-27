@@ -141,7 +141,9 @@ pub fn actions_row(
             } else {
                 Icon::PlayFilled
             };
-            if theme::circle_button(
+            if app.play_pending(uri) {
+                theme::circle_spinner(ui, 56.0, palette.accent, palette.on_accent, "Starting…");
+            } else if theme::circle_button(
                 ui,
                 icon,
                 56.0,

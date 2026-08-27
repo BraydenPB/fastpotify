@@ -40,6 +40,16 @@ as one ordinary desktop application rather than a shell plugin.
 - **Light and dark**, or follow the system.
 - **Keyboard-first.** Every common action has a shortcut (`Ctrl+/` lists
   them).
+- **Keeps playing when you close the window.** The window closes for real,
+  the music and the process stay in the system tray (Linux status notifier),
+  and clicking the tray — or your desktop's media controls — brings a window
+  back. No compositor-specific tricks, so it behaves the same on any
+  desktop. Quit from the tray menu or `Ctrl+Q`; turn the behaviour off in
+  Settings if you prefer close-to-quit.
+- **Honest about the network.** Pages show spinners while they load, a
+  quiet indicator appears in the top bar whenever the app is talking to
+  Spotify for more than a moment, and if Spotify asks the app to back off
+  you see "Spotify is busy — retrying" instead of an unexplained wait.
 - **Desktop integration.** MPRIS on Linux, so media keys, the shell, and
   `playerctl` see Fastpotify like any other player.
 
@@ -69,20 +79,24 @@ A desktop entry is provided in `packaging/fastpotify.desktop`.
 
 ## Sign in
 
-Press **Sign in with Spotify**. Your browser opens Spotify's own sign-in
-page; Fastpotify never sees your password. When Spotify redirects back, the
-app connects and stores a reusable credential in the platform's state
-directory (`~/.local/state/fastpotify` on Linux), so the browser is needed
-once per machine.
+Press **Sign in with Spotify**. Your browser opens Spotify's own consent
+page (Authorization Code with PKCE); Fastpotify never sees your password.
+When Spotify redirects back to the app, your library, search, and control
+of other devices work immediately. The refresh token is stored in the
+platform's state directory (`~/.local/state/fastpotify` on Linux), so the
+browser is needed once per machine.
 
-That one sign-in covers both playback and the Web API: Fastpotify uses
-Spotify's desktop client identity through librespot, and asks the session for
-Web API tokens the same way the official client does. No developer
-application, client secret, or refresh-token file is involved.
+Playing music **on this computer** is one more one-time browser approval —
+Spotify treats streaming as a separate grant for its own client identity,
+which is what librespot plays with. Take it from the device menu ("Play
+here — set up once") or Settings; it needs Spotify Premium, and librespot
+stores a reusable credential so it also never asks again. Browsing and
+remote control work on any account without this step.
 
-Playing music **on this computer** needs Spotify Premium, as with every
-librespot-based client. Browsing, search, and controlling other devices work
-on any account.
+By default the Web API uses the shared public application also used by
+spotify-player, ncspot, and Omarchy Spotify. If you hit rate limits you can
+register your own (free) Spotify application and paste its Client ID in
+Settings → Account.
 
 ## Keyboard shortcuts
 

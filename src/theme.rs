@@ -558,6 +558,31 @@ pub fn circle_button(
     }
 }
 
+/// A disc the size of a [`circle_button`] whose icon is replaced by a
+/// spinner: the pressed play button itself shows that Spotify is reacting.
+pub fn circle_spinner(
+    ui: &mut egui::Ui,
+    diameter: f32,
+    fill: Color32,
+    spin: Color32,
+    tooltip: &str,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter()
+            .circle_filled(rect.center(), diameter / 2.0, fill);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(
+            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        ));
+        spinner(&mut child, diameter * 0.55, spin);
+    }
+    if tooltip.is_empty() {
+        response
+    } else {
+        response.on_hover_text(tooltip)
+    }
+}
+
 /// A pill-shaped text button: filled for the primary action, outlined otherwise.
 pub fn pill_button(ui: &mut egui::Ui, palette: &Palette, label: &str, primary: bool) -> Response {
     let font = semibold(13.0);

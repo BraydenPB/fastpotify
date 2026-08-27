@@ -19,6 +19,11 @@ mod paths;
 mod player;
 mod settings;
 mod theme;
+#[cfg(target_os = "linux")]
+mod tray;
+#[cfg(not(target_os = "linux"))]
+#[path = "tray_stub.rs"]
+mod tray;
 mod ui;
 mod util;
 
@@ -72,7 +77,93 @@ fn main() -> eframe::Result<()> {
         settings.device_name = name;
     }
 
-    let options = eframe::NativeOptions {
+    // The application (audio engine, Web API, MPRIS, tray) outlives any
+    // window. Closing to the tray destroys the window and this loop creates
+    // a new one when the tray or MPRIS asks for it — plain window lifecycle,
+    // portable across desktops.
+    let waker = backend::Waker::default();
+    #[allow(unused_mut)]
+    let mut app = app::App::new(&waker, dirs, settings, app::AppOptions::default());
+    #[cfg(feature = "demo")]
+    if cli.demo {
+        demo::populate(&mut app);
+        demo::apply_flags(&mut app, cli.demo_page.as_deref(), cli.demo_show.as_deref());
+    }
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(app)));
+
+    loop {
+        let creator_slot = std::sync::Arc::clone(&slot);
+        let creator_waker = waker.clone();
+        let options = native_options();
+        eframe::run_native(
+            "Fastpotify",
+            options,
+            Box::new(move |cc| {
+                creator_waker.attach(&cc.egui_ctx);
+                let mut app = creator_slot
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                    .expect("application state present");
+                app.attach(&cc.egui_ctx);
+                Ok(Box::new(Shell {
+                    app: Some(app),
+                    slot: std::sync::Arc::clone(&creator_slot),
+                }))
+            }),
+        )?;
+        waker.detach();
+
+        let hide = {
+            let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+            let app = guard.as_ref().expect("application state present");
+            !app.quit_requested && app.hide_intent
+        };
+        if !hide {
+            break;
+        }
+
+        // Tray life: no window, but audio, MPRIS, the tray, and polling all
+        // keep running until Show or Quit.
+        let headless = egui::Context::default();
+        {
+            let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+            let app = guard.as_mut().expect("application state present");
+            app.window_hidden = true;
+            app.hide_intent = false;
+            app.wants_show = false;
+        }
+        loop {
+            {
+                let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+                let app = guard.as_mut().expect("application state present");
+                app.background_frame(&headless);
+                if app.quit_requested || app.wants_show {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        let quit = {
+            let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .as_ref()
+                .expect("application state present")
+                .quit_requested
+        };
+        if quit {
+            break;
+        }
+    }
+
+    if let Some(mut app) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        app.shutdown();
+    }
+    Ok(())
+}
+
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Fastpotify")
             .with_app_id("fastpotify")
@@ -87,67 +178,48 @@ fn main() -> eframe::Result<()> {
             ..Default::default()
         },
         ..Default::default()
-    };
-    eframe::run_native(
-        "Fastpotify",
-        options,
-        Box::new(move |cc| {
-            #[allow(unused_mut)]
-            let mut app = app::App::new(&cc.egui_ctx, dirs, settings, app::AppOptions::default());
-            #[cfg(feature = "demo")]
-            if cli.demo {
-                demo::populate(&mut app);
-                demo::apply_flags(&mut app, cli.demo_page.as_deref(), cli.demo_show.as_deref());
-            }
-            Ok(Box::new(app))
-        }),
-    )
+    }
 }
 
-/// The window icon: a green disc with a play mark, drawn at start so no
-/// binary image needs shipping.
-fn app_icon() -> egui::IconData {
-    const SIZE: usize = 128;
-    let mut rgba = vec![0u8; SIZE * SIZE * 4];
-    let center = SIZE as f32 / 2.0;
-    let radius = center - 2.0;
-    let triangle = [
-        (center - 12.0, center - 22.0),
-        (center - 12.0, center + 22.0),
-        (center + 26.0, center),
-    ];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            let distance = ((px - center).powi(2) + (py - center).powi(2)).sqrt();
-            let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
-                continue;
-            }
-            let inside = point_in_triangle((px, py), triangle);
-            let (r, g, b) = if inside { (10, 20, 14) } else { (30, 215, 96) };
-            let index = (y * SIZE + x) * 4;
-            rgba[index] = r;
-            rgba[index + 1] = g;
-            rgba[index + 2] = b;
-            rgba[index + 3] = (coverage * 255.0) as u8;
+/// The eframe adapter around the long-lived [`app::App`]: delegates frames
+/// and, when the window goes away, hands the state back for the next window.
+struct Shell {
+    app: Option<app::App>,
+    slot: std::sync::Arc<std::sync::Mutex<Option<app::App>>>,
+}
+
+impl eframe::App for Shell {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(app) = self.app.as_mut() {
+            app.background_frame(ctx);
         }
     }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(app) = self.app.as_mut() {
+            app.frame_ui(ui);
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(app) = self.app.as_mut() {
+            app.save_state();
+        }
+    }
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = self.app.take();
+    }
+}
+
+/// The window icon, from the shared runtime drawing.
+fn app_icon() -> egui::IconData {
+    const SIZE: usize = 128;
     egui::IconData {
-        rgba,
+        rgba: util::app_icon_rgba(SIZE),
         width: SIZE as u32,
         height: SIZE as u32,
     }
-}
-
-fn point_in_triangle(p: (f32, f32), t: [(f32, f32); 3]) -> bool {
-    let sign = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
-        (a.0 - c.0) * (b.1 - c.1) - (b.0 - c.0) * (a.1 - c.1)
-    };
-    let d1 = sign(p, t[0], t[1]);
-    let d2 = sign(p, t[1], t[2]);
-    let d3 = sign(p, t[2], t[0]);
-    let negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(negative && positive)
 }

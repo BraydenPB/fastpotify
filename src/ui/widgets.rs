@@ -514,7 +514,14 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
     // Number / play.
     if cols.number > 0.0 {
         let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.number, row_height));
-        if hovered && !unavailable {
+        if app.play_pending(row.item.uri()) {
+            let mut child = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(cell)
+                    .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+            );
+            theme::spinner(&mut child, 16.0, palette.accent);
+        } else if hovered && !unavailable {
             let icon = if playing {
                 Icon::PauseFilled
             } else {

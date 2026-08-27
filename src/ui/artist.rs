@@ -52,7 +52,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
             let following = app.is_saved(&artist.uri).unwrap_or(false);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 18.0;
-                if theme::circle_button(
+                if app.play_pending(&artist.uri) {
+                    theme::circle_spinner(ui, 56.0, palette.accent, palette.on_accent, "Starting…");
+                } else if theme::circle_button(
                     ui,
                     Icon::PlayFilled,
                     56.0,

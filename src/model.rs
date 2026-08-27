@@ -492,6 +492,8 @@ pub enum Action {
     SettingsChanged,
     RestartEngine,
     EnablePlayback,
+    ShowWindow,
+    HideWindow,
     ClearArtCache,
     Quit,
 }

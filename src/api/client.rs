@@ -8,9 +8,9 @@
 //! shape first and falls back to the classic one when Spotify answers that
 //! an endpoint is gone, remembering the answer for the rest of the session.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -204,22 +204,77 @@ impl PlayRequest {
     }
 }
 
+/// Live view of the client's traffic, shared with the interface so it can
+/// show that the app is talking to Spotify rather than being slow itself.
+pub struct NetActivity {
+    started_at: Instant,
+    in_flight: AtomicUsize,
+    /// Milliseconds since `started_at` when the oldest current burst began.
+    busy_since_ms: AtomicU64,
+}
+
+impl Default for NetActivity {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            in_flight: AtomicUsize::new(0),
+            busy_since_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+impl NetActivity {
+    fn now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
+    fn begin(&self) {
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.busy_since_ms.store(self.now_ms(), Ordering::SeqCst);
+        }
+    }
+
+    fn end(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Requests have been in flight continuously for at least `for_at_least`.
+    pub fn busy(&self, for_at_least: Duration) -> bool {
+        self.in_flight.load(Ordering::SeqCst) > 0
+            && self
+                .now_ms()
+                .saturating_sub(self.busy_since_ms.load(Ordering::SeqCst))
+                >= for_at_least.as_millis() as u64
+    }
+}
+
+/// Decrements the in-flight count even if the request future is dropped.
+struct ActivityGuard<'a>(&'a NetActivity);
+
+impl Drop for ActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
 pub struct ApiClient {
     http: reqwest::Client,
     tokens: Mutex<Option<TokenProvider>>,
     limiter: Semaphore,
     library_style: AtomicU8,
     search_limit: AtomicU32,
+    activity: Arc<NetActivity>,
 }
 
 impl ApiClient {
-    pub fn new(http: reqwest::Client) -> Self {
+    pub fn new(http: reqwest::Client, activity: Arc<NetActivity>) -> Self {
         Self {
             http,
             tokens: Mutex::new(None),
             limiter: Semaphore::new(MAX_IN_FLIGHT),
             library_style: AtomicU8::new(LibraryStyle::Modern as u8),
             search_limit: AtomicU32::new(20),
+            activity,
         }
     }
 
@@ -263,6 +318,8 @@ impl ApiClient {
             format!("{BASE_URL}{path}")
         };
         let provider = self.provider()?;
+        self.activity.begin();
+        let _activity = ActivityGuard(&self.activity);
         let _permit = self
             .limiter
             .acquire()

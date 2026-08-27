@@ -54,6 +54,8 @@ pub struct Settings {
     /// Local playback has been authorized at least once on this machine, so
     /// the app can resume it silently instead of prompting.
     pub playback_authorized: bool,
+    /// Closing the window hides to the tray and keeps the music playing.
+    pub keep_playing_in_background: bool,
 }
 
 impl Default for Settings {
@@ -76,6 +78,7 @@ impl Default for Settings {
             show_shortcut_hints: true,
             web_client_id: None,
             playback_authorized: false,
+            keep_playing_in_background: true,
         }
     }
 }

@@ -552,9 +552,8 @@ mod tests {
             )),
             ..Default::default()
         };
-        let mut eframe_frame = eframe::Frame::_new_kittest();
         let mut output = ctx.run_ui(input, |ui| {
-            eframe::App::ui(app, ui, &mut eframe_frame);
+            app.frame_ui(ui);
         });
         output.textures_delta.clear();
     }
@@ -570,7 +569,18 @@ mod tests {
             cache: root.join("cache"),
         };
         let ctx = egui::Context::default();
-        let mut app = App::new(&ctx, dirs, Settings::default(), AppOptions { mpris: false });
+        let waker = crate::backend::Waker::default();
+        waker.attach(&ctx);
+        let mut app = App::new(
+            &waker,
+            dirs,
+            Settings::default(),
+            AppOptions {
+                mpris: false,
+                tray: false,
+            },
+        );
+        app.attach(&ctx);
         populate(&mut app);
 
         let pages = [

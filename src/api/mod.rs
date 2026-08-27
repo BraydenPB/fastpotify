@@ -3,4 +3,4 @@
 pub mod client;
 pub mod models;
 
-pub use client::{ApiClient, ApiError, PlayRequest, TokenProvider, WebTokens};
+pub use client::{ApiClient, ApiError, NetActivity, PlayRequest, TokenProvider, WebTokens};

@@ -13,7 +13,7 @@ use librespot_core::authentication::Credentials;
 use tokio::sync::{mpsc, watch};
 
 use crate::api::models::*;
-use crate::api::{ApiClient, ApiError, PlayRequest, TokenProvider, WebTokens};
+use crate::api::{ApiClient, ApiError, NetActivity, PlayRequest, TokenProvider, WebTokens};
 use crate::images::{ArtLoader, accent_color};
 use crate::paths::AppDirs;
 use crate::player::{Engine, EngineConfig, EngineEvent, LocalState, PlayerCommand};
@@ -366,11 +366,37 @@ pub enum LocalPlayback {
     Failed(String),
 }
 
+/// Wakes whichever window currently exists, if any.
+///
+/// Background services (the runtime, MPRIS, the tray) outlive individual
+/// windows: the window is destroyed when it closes to the tray and created
+/// again on demand. They therefore hold this handle instead of an
+/// `egui::Context`.
+#[derive(Clone, Default)]
+pub struct Waker(Arc<std::sync::Mutex<Option<egui::Context>>>);
+
+impl Waker {
+    pub fn attach(&self, ctx: &egui::Context) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
+    }
+
+    pub fn detach(&self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    pub fn wake(&self) {
+        if let Some(ctx) = self.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            ctx.request_repaint();
+        }
+    }
+}
+
 /// The interface's handle to the runtime.
 pub struct Backend {
     commands: mpsc::UnboundedSender<Command>,
     events: std::sync::mpsc::Receiver<Event>,
     art: ArtLoader,
+    activity: Arc<NetActivity>,
     thread: Option<std::thread::JoinHandle<()>>,
     offline: bool,
 }
@@ -380,7 +406,7 @@ impl Backend {
         dirs: AppDirs,
         engine_config: EngineConfig,
         web_client_id: Option<String>,
-        ctx: egui::Context,
+        waker: Waker,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -396,7 +422,9 @@ impl Backend {
             .build()
             .expect("unable to build the HTTP client");
         let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
+        let activity = Arc::new(NetActivity::default());
 
+        let worker_activity = Arc::clone(&activity);
         let worker_art = art.clone();
         let worker_commands = command_tx.clone();
         let thread = std::thread::Builder::new()
@@ -409,9 +437,10 @@ impl Backend {
                         web_client_id,
                         http,
                         worker_art,
+                        worker_activity,
                         event_tx,
                         worker_commands,
-                        ctx,
+                        waker,
                     );
                     worker.run(command_rx).await;
                 });
@@ -424,9 +453,15 @@ impl Backend {
             commands: command_tx,
             events: event_rx,
             art,
+            activity,
             thread: Some(thread),
             offline: false,
         }
+    }
+
+    /// Live network activity, for the interface's busy indicator.
+    pub fn activity(&self) -> &NetActivity {
+        &self.activity
     }
 
     /// Stops Spotify-bound commands from leaving the process; artwork and
@@ -476,7 +511,7 @@ struct Worker {
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
-    ctx: egui::Context,
+    waker: Waker,
     engine: Option<Arc<Engine>>,
     /// True while a playback grant or engine connection is in flight, so a
     /// second attempt does not pile up.
@@ -494,20 +529,21 @@ impl Worker {
         web_client_id: Option<String>,
         http: reqwest::Client,
         art: ArtLoader,
+        activity: Arc<NetActivity>,
         events: std::sync::mpsc::Sender<Event>,
         commands: mpsc::UnboundedSender<Command>,
-        ctx: egui::Context,
+        waker: Waker,
     ) -> Self {
         Self {
             dirs,
             engine_config,
             web_client_id,
-            api: Arc::new(ApiClient::new(http.clone())),
+            api: Arc::new(ApiClient::new(http.clone(), activity)),
             http,
             art,
             events,
             commands,
-            ctx,
+            waker,
             engine: None,
             engine_busy: false,
             signed_in: false,
@@ -518,7 +554,7 @@ impl Worker {
 
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
-        self.ctx.request_repaint();
+        self.waker.wake();
     }
 
     async fn run(&mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
@@ -622,7 +658,7 @@ impl Worker {
         }
         let http = self.http.clone();
         let events = self.events.clone();
-        let ctx = self.ctx.clone();
+        let waker = self.waker.clone();
         let commands = self.commands.clone();
         tokio::spawn(async move {
             let result = async {
@@ -643,7 +679,7 @@ impl Worker {
                     if !message.contains("cancelled") {
                         let _ = events.send(Event::Error(format!("Sign-in failed: {message}")));
                     }
-                    ctx.request_repaint();
+                    waker.wake();
                     let _ = commands.send(Command::SignInEnded);
                 }
             }
@@ -670,11 +706,11 @@ impl Worker {
     fn engine_notify(&self) -> crate::player::Notify {
         let events = self.events.clone();
         let commands = self.commands.clone();
-        let ctx = self.ctx.clone();
+        let waker = self.waker.clone();
         Arc::new(move |event| match event {
             EngineEvent::State(state) => {
                 let _ = events.send(Event::Local(Box::new(state)));
-                ctx.request_repaint();
+                waker.wake();
             }
             EngineEvent::SessionEnded => {
                 let _ = commands.send(Command::Reconnect);
@@ -736,7 +772,7 @@ impl Worker {
         }
         let http = self.http.clone();
         let events = self.events.clone();
-        let ctx = self.ctx.clone();
+        let waker = self.waker.clone();
         let commands = self.commands.clone();
         tokio::spawn(async move {
             let result = async {
@@ -758,7 +794,7 @@ impl Worker {
                     } else {
                         let _ = events.send(Event::Playback(LocalPlayback::Failed(message)));
                     }
-                    ctx.request_repaint();
+                    waker.wake();
                     let _ = commands.send(Command::SignInEnded);
                 }
             }
@@ -780,7 +816,7 @@ impl Worker {
         let notify = self.engine_notify();
         let events = self.events.clone();
         let commands = self.commands.clone();
-        let ctx = self.ctx.clone();
+        let waker = self.waker.clone();
         tokio::spawn(async move {
             let cache = match config.open_cache() {
                 Ok(cache) => cache,
@@ -816,7 +852,7 @@ impl Worker {
             };
             let _ = commands.send(outcome);
             let _ = events;
-            ctx.request_repaint();
+            waker.wake();
         });
     }
 
@@ -841,18 +877,18 @@ impl Worker {
     fn dispatch(&self, request: ApiRequest) {
         let api = Arc::clone(&self.api);
         let events = self.events.clone();
-        let ctx = self.ctx.clone();
+        let waker = self.waker.clone();
         tokio::spawn(async move {
             let response = handle(&api, request).await;
             let _ = events.send(Event::Api(Box::new(response)));
-            ctx.request_repaint();
+            waker.wake();
         });
     }
 
     fn accent(&self, url: String) {
         let art = self.art.clone();
         let events = self.events.clone();
-        let ctx = self.ctx.clone();
+        let waker = self.waker.clone();
         tokio::spawn(async move {
             if let Ok(bytes) = art.fetch(&url).await {
                 let color = tokio::task::spawn_blocking(move || accent_color(&bytes))
@@ -861,7 +897,7 @@ impl Worker {
                     .flatten();
                 if let Some(color) = color {
                     let _ = events.send(Event::Accent { url, color });
-                    ctx.request_repaint();
+                    waker.wake();
                 }
             }
         });

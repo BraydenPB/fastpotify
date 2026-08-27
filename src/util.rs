@@ -97,6 +97,46 @@ pub fn open_spotify_url(uri: &str) -> Option<String> {
     Some(format!("https://open.spotify.com/{kind}/{id}"))
 }
 
+/// The application icon, drawn at runtime: a green disc with a play mark.
+/// Shared by the window icon and the tray pixmap.
+pub fn app_icon_rgba(size: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; size * size * 4];
+    let center = size as f32 / 2.0;
+    let radius = center - 2.0;
+    let scale = size as f32 / 128.0;
+    let triangle = [
+        (center - 12.0 * scale, center - 22.0 * scale),
+        (center - 12.0 * scale, center + 22.0 * scale),
+        (center + 26.0 * scale, center),
+    ];
+    let sign = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+        (a.0 - c.0) * (b.1 - c.1) - (b.0 - c.0) * (a.1 - c.1)
+    };
+    for y in 0..size {
+        for x in 0..size {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let distance = ((px - center).powi(2) + (py - center).powi(2)).sqrt();
+            let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let d1 = sign((px, py), triangle[0], triangle[1]);
+            let d2 = sign((px, py), triangle[1], triangle[2]);
+            let d3 = sign((px, py), triangle[2], triangle[0]);
+            let negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+            let positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+            let inside = !(negative && positive);
+            let (r, g, b) = if inside { (10, 20, 14) } else { (30, 215, 96) };
+            let index = (y * size + x) * 4;
+            rgba[index] = r;
+            rgba[index + 1] = g;
+            rgba[index + 2] = b;
+            rgba[index + 3] = (coverage * 255.0) as u8;
+        }
+    }
+    rgba
+}
+
 pub fn greeting() -> &'static str {
     match local_hour() {
         5..=11 => "Good morning",

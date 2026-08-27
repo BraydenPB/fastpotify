@@ -11,6 +11,7 @@ use crate::api::models::{
 };
 use crate::backend::{
     ApiRequest, ApiResponse, AuthStatus, Backend, Command, Event, LocalPlayback, RemoteAction,
+    Waker,
 };
 use crate::model::*;
 use crate::mpris::{MprisCommand, MprisService, MprisState, MprisTrack};
@@ -18,6 +19,7 @@ use crate::paths::AppDirs;
 use crate::player::{EngineConfig, LoadSpec, LocalState, Playback, PlayerCommand, RepeatMode};
 use crate::settings::{SessionState, Settings, ThemeChoice};
 use crate::theme::{self, Palette};
+use crate::tray::{TrayCommand, TrayService};
 use crate::util;
 
 const REMOTE_POLL_ACTIVE: Duration = Duration::from_secs(4);
@@ -71,11 +73,16 @@ pub enum Target {
 pub struct AppOptions {
     /// Register the MPRIS media-control service (Linux).
     pub mpris: bool,
+    /// Register the system-tray item (Linux).
+    pub tray: bool,
 }
 
 impl Default for AppOptions {
     fn default() -> Self {
-        Self { mpris: true }
+        Self {
+            mpris: true,
+            tray: true,
+        }
     }
 }
 
@@ -86,6 +93,13 @@ pub struct App {
     last_settings_save: Instant,
     pub backend: Backend,
     mpris: Option<MprisService>,
+    tray: Option<TrayService>,
+    pub window_hidden: bool,
+    /// The window should close but the process should stay in the tray.
+    pub hide_intent: bool,
+    /// A hidden app was asked to show itself; the outer loop recreates the
+    /// window.
+    pub wants_show: bool,
     /// Sample data is loaded and nothing is asked of Spotify.
     pub offline: bool,
     pub palette: Palette,
@@ -132,6 +146,13 @@ pub struct App {
     pub toasts: Vec<Toast>,
     pub actions: Vec<Action>,
     volume_before_mute: Option<u8>,
+    /// What was just asked to play, until Spotify visibly reacts: the keys
+    /// (context and track URIs) whose play buttons show a spinner.
+    pending_play_keys: Vec<String>,
+    pending_play_at: Option<Instant>,
+    /// A play request made while the local engine was still connecting; it
+    /// starts the moment the engine reports ready.
+    queued_play: Option<PlayRequest>,
     pub seek_preview: Option<f32>,
     pub volume_preview: Option<f32>,
     last_eviction: Instant,
@@ -145,30 +166,23 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        ctx: &egui::Context,
-        dirs: AppDirs,
-        settings: Settings,
-        options: AppOptions,
-    ) -> Self {
-        theme::install(ctx);
-        ctx.set_theme(match settings.theme {
-            ThemeChoice::Dark => egui::ThemePreference::Dark,
-            ThemeChoice::Light => egui::ThemePreference::Light,
-            ThemeChoice::System => egui::ThemePreference::System,
-        });
+    pub fn new(waker: &Waker, dirs: AppDirs, settings: Settings, options: AppOptions) -> Self {
         let engine_config = engine_config(&dirs, &settings);
         let backend = Backend::spawn(
             dirs.clone(),
             engine_config,
             settings.web_client_id.clone(),
-            ctx.clone(),
+            waker.clone(),
         );
-        ctx.add_bytes_loader(std::sync::Arc::new(backend.art().clone()));
-        let repaint = ctx.clone();
+        let wake = waker.clone();
         let mpris = options
             .mpris
-            .then(|| MprisService::spawn(move || repaint.request_repaint()));
+            .then(|| MprisService::spawn(move || wake.wake()));
+        let wake = waker.clone();
+        let tray = options
+            .tray
+            .then(|| TrayService::spawn(move || wake.wake()))
+            .flatten();
 
         let session = SessionState::load(&dirs.session_file());
         let first_page = session
@@ -185,6 +199,10 @@ impl App {
             last_settings_save: Instant::now(),
             backend,
             mpris,
+            tray,
+            window_hidden: false,
+            hide_intent: false,
+            wants_show: false,
             offline: false,
             palette: Palette::dark(),
             applied_dark: None,
@@ -224,6 +242,9 @@ impl App {
             toasts: Vec::new(),
             actions: Vec::new(),
             volume_before_mute: None,
+            pending_play_keys: Vec::new(),
+            pending_play_at: None,
+            queued_play: None,
             seek_preview: None,
             volume_preview: None,
             last_eviction: Instant::now(),
@@ -237,6 +258,22 @@ impl App {
         };
         app.local.volume = app.settings.volume;
         app
+    }
+
+    /// Per-window setup: fonts, icons, loaders, theme. Called every time a
+    /// window is (re)created around this long-lived application state.
+    pub fn attach(&mut self, ctx: &egui::Context) {
+        theme::install(ctx);
+        ctx.add_bytes_loader(std::sync::Arc::new(self.backend.art().clone()));
+        ctx.set_theme(match self.settings.theme {
+            ThemeChoice::Dark => egui::ThemePreference::Dark,
+            ThemeChoice::Light => egui::ThemePreference::Light,
+            ThemeChoice::System => egui::ThemePreference::System,
+        });
+        self.applied_dark = None;
+        self.window_hidden = false;
+        self.hide_intent = false;
+        self.wants_show = false;
     }
 
     // ---- derived state -----------------------------------------------------
@@ -417,6 +454,35 @@ impl App {
         })
     }
 
+    /// The play request for `key` (a context or track URI) is still waiting
+    /// for Spotify to react.
+    pub fn play_pending(&self, key: &str) -> bool {
+        self.pending_fresh() && self.pending_play_keys.iter().any(|k| k == key)
+    }
+
+    pub fn any_play_pending(&self) -> bool {
+        self.pending_fresh() && !self.pending_play_keys.is_empty()
+    }
+
+    fn pending_fresh(&self) -> bool {
+        // A request queued behind a connecting engine stays pending for as
+        // long as the engine may take; an ordinary request times out fast.
+        self.queued_play.is_some()
+            || self
+                .pending_play_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(8))
+    }
+
+    fn set_play_pending(&mut self, keys: Vec<String>) {
+        self.pending_play_keys = keys;
+        self.pending_play_at = Some(Instant::now());
+    }
+
+    fn clear_play_pending(&mut self) {
+        self.pending_play_keys.clear();
+        self.pending_play_at = None;
+    }
+
     /// The colour to tint the interface with, from the playing art.
     pub fn now_playing_tint(&self) -> Option<Color32> {
         if !self.settings.accent_from_art {
@@ -496,6 +562,9 @@ impl App {
             LocalPlayback::Ready { device_id } => {
                 self.local_device_id = Some(device_id.clone());
                 self.local_ready = true;
+                if let Some(request) = self.queued_play.take() {
+                    self.play_request(request);
+                }
             }
             LocalPlayback::Unavailable => {
                 self.local_ready = false;
@@ -503,6 +572,9 @@ impl App {
             }
             LocalPlayback::Failed(message) => {
                 self.local_ready = false;
+                if self.queued_play.take().is_some() {
+                    self.clear_play_pending();
+                }
                 self.toast_error(format!("Local playback: {message}"));
             }
             LocalPlayback::Authorizing | LocalPlayback::Connecting => {}
@@ -530,6 +602,12 @@ impl App {
         let track_changed = state.track != self.local.track;
         if state.playback != self.local.playback {
             self.optimistic_playing = None;
+            if matches!(state.playback, Playback::Playing | Playback::Loading) {
+                self.clear_play_pending();
+            }
+        }
+        if state.track != self.local.track {
+            self.clear_play_pending();
         }
         if state.volume != self.local.volume {
             self.settings.volume = state.volume;
@@ -651,6 +729,25 @@ impl App {
         }
     }
 
+    fn handle_tray(&mut self) {
+        let Some(commands) = self.tray.as_ref().map(TrayService::drain_commands) else {
+            return;
+        };
+        for command in commands {
+            match command {
+                TrayCommand::ShowHide => self.actions.push(if self.window_hidden {
+                    Action::ShowWindow
+                } else {
+                    Action::HideWindow
+                }),
+                TrayCommand::PlayPause => self.actions.push(Action::TogglePlay),
+                TrayCommand::Next => self.actions.push(Action::Next),
+                TrayCommand::Previous => self.actions.push(Action::Previous),
+                TrayCommand::Quit => self.actions.push(Action::Quit),
+            }
+        }
+    }
+
     fn handle_mpris(&mut self) {
         let Some(commands) = self.mpris.as_ref().map(MprisService::drain_commands) else {
             return;
@@ -681,7 +778,7 @@ impl App {
                     offset_uri: None,
                     offset_index: None,
                 }),
-                MprisCommand::Raise => None,
+                MprisCommand::Raise => Some(Action::ShowWindow),
                 MprisCommand::Quit => Some(Action::Quit),
             };
             if let Some(action) = action {
@@ -722,6 +819,10 @@ impl App {
         };
         if let Some(mpris) = &mut self.mpris {
             mpris.update(state);
+        }
+        let playing = self.now_playing().is_some_and(|now| now.playing);
+        if let Some(tray) = &mut self.tray {
+            tray.set_playing(playing);
         }
     }
 
@@ -1609,6 +1710,9 @@ impl App {
                 }
             }
             ApiResponse::Remote { action, result } => {
+                if matches!(action, RemoteAction::Play | RemoteAction::Pause) {
+                    self.clear_play_pending();
+                }
                 match result {
                     Ok(()) => {}
                     Err(error) => {
@@ -1679,6 +1783,12 @@ impl App {
     // ---- playback --------------------------------------------------------------
 
     fn remote(&mut self, action: RemoteAction, device_id: Option<String>) {
+        if device_id.is_none() && self.remote_fresh().is_none() {
+            // Spotify would only answer "no active device found".
+            self.clear_play_pending();
+            self.toast("Nothing is playing — pick something first");
+            return;
+        }
         self.backend.api(ApiRequest::Remote {
             action,
             device_id,
@@ -1691,8 +1801,25 @@ impl App {
     }
 
     fn play_request(&mut self, request: PlayRequest) {
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(context) = &request.context_uri {
+            keys.push(context.clone());
+        }
+        if let Some(offset) = &request.offset_uri {
+            keys.push(offset.clone());
+        }
+        if let Some(first) = request.uris.first() {
+            keys.push(first.clone());
+        }
+        if let Some(position) = request.offset_position
+            && let Some(uri) = request.uris.get(position as usize)
+        {
+            keys.push(uri.clone());
+        }
+        self.set_play_pending(keys);
         match self.target() {
             Target::Local => {
+                self.queued_play = None;
                 self.backend.player(PlayerCommand::Load(LoadSpec {
                     context_uri: request.context_uri.clone(),
                     uris: request.uris.clone(),
@@ -1704,10 +1831,11 @@ impl App {
                 }));
                 self.optimistic_playing = Some((true, Instant::now()));
             }
-            Target::Remote(device_id) => {
+            Target::Remote(Some(device_id)) => {
+                self.queued_play = None;
                 self.backend.api(ApiRequest::Remote {
                     action: RemoteAction::Play,
-                    device_id,
+                    device_id: Some(device_id),
                     play: Some(request),
                     position_ms: 0,
                     percent: 0,
@@ -1715,6 +1843,23 @@ impl App {
                     repeat: String::new(),
                 });
                 self.optimistic_playing = Some((true, Instant::now()));
+            }
+            Target::Remote(None) => {
+                // No remote device is active, and this computer's player is
+                // not ready. Never ask Spotify to play "nowhere" — either
+                // wait for the connecting engine or ask for a device.
+                if matches!(
+                    self.local_playback,
+                    LocalPlayback::Connecting | LocalPlayback::Authorizing
+                ) {
+                    self.queued_play = Some(request);
+                } else {
+                    self.clear_play_pending();
+                    self.queued_play = None;
+                    self.toast("Choose a device, or enable playback on this computer");
+                    self.show_devices = true;
+                    self.refresh_devices();
+                }
             }
         }
     }
@@ -1752,6 +1897,11 @@ impl App {
                 }
             }
             Target::Remote(device_id) => {
+                if device_id.is_none() && self.remote_fresh().is_none() {
+                    self.toast("Pick a song, album, or playlist");
+                    return;
+                }
+                self.set_play_pending(vec!["::toggle".into()]);
                 if playing == Some(true) {
                     self.remote(RemoteAction::Pause, device_id);
                 } else {
@@ -1989,6 +2139,7 @@ impl App {
             },
             Action::ShufflePlay(uri) => match self.target() {
                 Target::Local => {
+                    self.set_play_pending(vec![uri.clone()]);
                     self.backend.player(PlayerCommand::Load(LoadSpec {
                         context_uri: Some(uri),
                         uris: Vec::new(),
@@ -2273,6 +2424,20 @@ impl App {
                     self.toast("Restarting local playback");
                 }
             }
+            Action::ShowWindow => {
+                if self.window_hidden {
+                    // No window exists; the outer loop creates one.
+                    self.wants_show = true;
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            }
+            Action::HideWindow => {
+                if self.tray.is_some() {
+                    self.hide_intent = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
             Action::EnablePlayback => {
                 if !self.local_ready
                     && !matches!(
@@ -2341,18 +2506,21 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Runs even while the window is hidden, so playback state, MPRIS, and
-        // settings keep flowing without a visible frame.
+impl App {
+    /// Everything that must keep happening whether or not a window exists:
+    /// backend events, MPRIS, the tray, polling, and pending actions. The
+    /// headless loop in `main` drives this with a windowless context while
+    /// the app lives in the tray.
+    pub fn background_frame(&mut self, ctx: &egui::Context) {
         self.handle_events();
         self.handle_mpris();
+        self.handle_tray();
         self.tick(ctx);
         self.apply_actions(ctx);
         self.sync_mpris();
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    pub fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.apply_theme(ctx);
@@ -2367,15 +2535,26 @@ impl eframe::App for App {
         if !self.toasts.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
+        if self.any_play_pending() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
         if self.is_connected() {
             ctx.request_repaint_after(REMOTE_POLL_ACTIVE);
         }
-        if ctx.input(|input| input.viewport().close_requested()) {
-            self.quit_requested = true;
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.quit_requested
+            && self.settings.keep_playing_in_background
+            && self.tray.is_some()
+        {
+            // The window genuinely closes; the process stays in the tray and
+            // the outer loop recreates a window on demand. No compositor
+            // tricks: this works the same on every desktop.
+            self.hide_intent = true;
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    /// Persist state when a window closes (to the tray or for good).
+    pub fn save_state(&mut self) {
         self.save_settings();
         if !self.offline {
             SessionState {
@@ -2383,6 +2562,11 @@ impl eframe::App for App {
             }
             .save(&self.dirs.session_file());
         }
+    }
+
+    /// Final teardown at real quit.
+    pub fn shutdown(&mut self) {
+        self.save_state();
         self.backend.shutdown();
     }
 }

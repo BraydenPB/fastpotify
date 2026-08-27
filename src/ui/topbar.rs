@@ -212,6 +212,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 {
                     app.actions.push(Action::Open(Page::Settings));
                 }
+                // A quiet spinner once the app has been talking to Spotify for a
+                // while — long enough that fast requests never flash it.
+                if app
+                    .backend
+                    .activity()
+                    .busy(std::time::Duration::from_millis(1000))
+                {
+                    theme::spinner(ui, 15.0, palette.secondary)
+                        .on_hover_text("Talking to Spotify…");
+                }
                 // Where playback is.
                 if let Some(now) = app.now_playing()
                     && !now.local
