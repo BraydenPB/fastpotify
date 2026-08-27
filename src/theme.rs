@@ -535,8 +535,12 @@ pub fn circle_button(
         let fill = if hovered { fill_hover } else { fill };
         ui.painter().circle_filled(rect.center(), radius, fill);
         let icon_size = diameter * 0.46;
+        // Lucide draws its play triangle about one viewBox unit right of
+        // centre (an optical correction). Undo it so the glyph is
+        // geometrically centred in the disc — for every play button
+        // everywhere.
         let offset = if matches!(icon, Icon::PlayFilled | Icon::Play) {
-            Vec2::new(diameter * 0.04, 0.0)
+            Vec2::new(-icon_size / 24.0, 0.0)
         } else {
             Vec2::ZERO
         };

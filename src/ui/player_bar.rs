@@ -209,6 +209,10 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, width: 
         palette.dim
     };
     ui.horizontal(|ui| {
+        // Declare the row height up front: egui centres each item in the row
+        // height known at the time it is added, so without this the icons
+        // added before the 36px play circle would sit high.
+        ui.set_row_height(36.0);
         ui.spacing_mut().item_spacing.x = 10.0;
         let total = 4.0 * 30.0 + 36.0 + 4.0 * 10.0;
         ui.add_space(((width - total) / 2.0).max(0.0));
