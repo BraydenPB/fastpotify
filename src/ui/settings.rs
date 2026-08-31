@@ -316,7 +316,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Keep music playing when the window closes",
-            "Fastpotify hides to the system tray. Quit from the tray menu or with Ctrl+Q.",
+            super::keys::platform_shortcut(
+                "Fastpotify hides to the system tray. Quit from the tray menu or with Ctrl+Q.",
+                "Fastpotify hides to the system tray. Quit from the tray menu or with Cmd+Q.",
+            ),
             |ui| {
                 if widgets::switch(ui, &palette, &mut app.settings.keep_playing_in_background)
                     .changed()
@@ -479,7 +482,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Interface zoom",
-            "Ctrl+Plus and Ctrl+Minus work anywhere; Ctrl+0 resets.",
+            super::keys::platform_shortcut(
+                "Ctrl+Plus and Ctrl+Minus work anywhere; Ctrl+0 resets.",
+                "Cmd+Plus and Cmd+Minus work anywhere; Cmd+0 resets.",
+            ),
             |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -511,7 +517,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Mini player",
-            "Fastpotify becomes a small player that wears classic Winamp skins (.wsz files); the logo in the skin, or Ctrl+M, brings this window back. Drop a skin on either window to add it.",
+            super::keys::platform_shortcut(
+                "Fastpotify becomes a small player that wears classic Winamp skins (.wsz files); the logo in the skin, or Ctrl+M, brings this window back. Drop a skin on either window to add it.",
+                "Fastpotify becomes a small player that wears classic Winamp skins (.wsz files); the logo in the skin, or Cmd+Shift+M, brings this window back. Drop a skin on either window to add it.",
+            ),
             |ui| {
                 if theme::pill_button(ui, &palette, "Switch to it", true).clicked() {
                     app.actions.push(Action::ToggleWinampWindow);
@@ -615,7 +624,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "MilkDrop window",
-            "Winamp's visualiser, as projectM reimplements it, in a window of its own; the vis button in the top bar, Ctrl+Shift+K, or the V on the mini player opens it too. Inside it, F or a double-click fills the screen, the arrows or N and P change the preset, L keeps one, and Esc leaves. It draws the music played on this computer.",
+            super::keys::platform_shortcut(
+                "Winamp's visualiser, as projectM reimplements it, in a window of its own; the vis button in the top bar, Ctrl+Shift+K, or the V on the mini player opens it too. Inside it, F or a double-click fills the screen, the arrows or N and P change the preset, L keeps one, and Esc leaves. It draws the music played on this computer.",
+                "Winamp's visualiser, as projectM reimplements it, in a window of its own; the vis button in the top bar, Cmd+Shift+K, or the V on the mini player opens it too. Inside it, F or a double-click fills the screen, the arrows or N and P change the preset, L keeps one, and Esc leaves. It draws the music played on this computer.",
+            ),
             |ui| {
                 let mut open = app.settings.milkdrop_open;
                 if widgets::switch(ui, &palette, &mut open).changed() {
